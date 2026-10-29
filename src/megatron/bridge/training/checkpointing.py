@@ -1521,9 +1521,10 @@ def save_checkpoint(
                         "torch_dist",
                         1,
                         thread_count=ckpt_cfg.storage_writers_per_rank,
+                        cpu_shm_mode=ckpt_cfg.async_ckpt_use_cpu_shm,
                     )
                 else:
-                    save_strategy = TorchDistSaveShardedStrategy()
+                    save_strategy = TorchDistSaveShardedStrategy(cpu_shm_mode=ckpt_cfg.async_ckpt_use_cpu_shm)
                 if ckpt_cfg.ckpt_assume_constant_structure and ckpt_cfg.ckpt_format == "torch_dist":
                     save_strategy.use_cached_ckpt_structure = ckpt_cfg.ckpt_assume_constant_structure
                     if checkpointing_context is not None and "load_strategy" in checkpointing_context:
