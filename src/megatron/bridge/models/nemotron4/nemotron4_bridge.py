@@ -315,7 +315,8 @@ class Nemotron4Bridge(MegatronModelBridge):
         mtp_depths = getattr(text, "num_nextn_predict_layers", 0)
         pattern = layer_types_to_hybrid_pattern(list(text.layer_types))
         if mtp_depths:
-            # Every Nemotron4 MTP depth is one shortcut attention + MoE block.
+            # Every Nemotron4 MTP depth is one attention + MoE pair: a shortcut block, or
+            # attention then MoE under moe_shortcut_disable_mtp.
             pattern += "/*E" * mtp_depths
         return Nemotron4VLModelProvider(
             hybrid_layer_pattern=pattern,
@@ -331,6 +332,7 @@ class Nemotron4Bridge(MegatronModelBridge):
             layernorm_epsilon=text.rms_norm_eps,
             init_method_std=text.initializer_range,
             activation_func_tanh_clamp_scale=text.activation_clamp_value,
+            fp32_residual_connection=text.residual_in_fp32,
             vocab_size=text.vocab_size,
             seq_length=text.max_position_embeddings,
             share_embeddings_and_output_weights=hf_config.tie_word_embeddings,
@@ -366,6 +368,8 @@ class Nemotron4Bridge(MegatronModelBridge):
             img_h=vision.image_size,
             img_w=vision.image_size,
             vision_projection_ffn_hidden_size=None,
+            moe_router_qb_bias_space=getattr(text, "moe_router_bias_space", "score"),
+            moe_shortcut_disable_mtp=getattr(text, "moe_shortcut_disable_mtp", False),
             **sparse_attention,
         )
 
@@ -378,6 +382,10 @@ class Nemotron4Bridge(MegatronModelBridge):
             if getattr(provider, "experimental_attention_variant", None) == "ssa"
             else None,
             index_head_dim=_SSA_INDEX_HEAD_DIM,
+            moe_router_bias_space=getattr(provider, "moe_router_qb_bias_space", "score"),
+            residual_in_fp32=bool(provider.fp32_residual_connection),
+            gdp_g_clamp_value=getattr(provider, "gdp_g_clamp_value", None),
+            moe_shortcut_disable_mtp=bool(getattr(provider, "moe_shortcut_disable_mtp", False)),
         )
         return hf_cfg
 
@@ -480,13 +488,24 @@ class Nemotron4Bridge(MegatronModelBridge):
 
         def shortcut_moe(block: str, hf: str) -> list[MegatronParamMapping]:
             """The shortcut block's MoE half, without wide-residual controllers."""
-            mlp = f"{block}.moe_layer.mlp"
-            moe = f"{hf}.moe"
             entries = [
                 ReplicatedMapping(
                     f"{block}.shortcut_pre_mlp_layernorm.weight", f"{hf}.shortcut_input_layernorm.weight"
                 ),
-                ReplicatedMapping(f"{block}.moe_layer.pre_mlp_layernorm.weight", f"{hf}.pre_moe_layernorm.weight"),
+                *moe_layer(f"{block}.moe_layer", hf),
+            ]
+            if text.moe_shortcut_post_norm:
+                entries.append(
+                    ReplicatedMapping(f"{block}.shortcut_post_norm.weight", f"{hf}.shortcut_post_norm.weight")
+                )
+            return entries
+
+        def moe_layer(layer: str, hf: str) -> list[MegatronParamMapping]:
+            """A MoE layer's norm, router, latent projections and experts."""
+            mlp = f"{layer}.mlp"
+            moe = f"{hf}.moe"
+            entries = [
+                ReplicatedMapping(f"{layer}.pre_mlp_layernorm.weight", f"{hf}.pre_moe_layernorm.weight"),
                 ReplicatedMapping(f"{mlp}.router.weight", f"{moe}.gate.weight"),
                 ReplicatedMapping(f"{mlp}.router.expert_bias", f"{moe}.gate.e_score_correction_bias"),
                 _MegatronOnlyStateMapping(
@@ -505,10 +524,6 @@ class Nemotron4Bridge(MegatronModelBridge):
             ]
             if text.moe_use_norm_before_up_proj:
                 entries.append(ReplicatedMapping(f"{mlp}.fc2_norm.weight", f"{moe}.fc2_norm.weight"))
-            if text.moe_shortcut_post_norm:
-                entries.append(
-                    ReplicatedMapping(f"{block}.shortcut_post_norm.weight", f"{hf}.shortcut_post_norm.weight")
-                )
             return entries
 
         # Shortcut blocks first: their names nest one level deeper than standalone layers.
@@ -545,15 +560,21 @@ class Nemotron4Bridge(MegatronModelBridge):
         if getattr(text, "num_nextn_predict_layers", 0):
             M = "language_model.mtp.layers.*"
             HMTP = "model.language_model.mtp.layers.*"
-            inner = f"{M}.mtp_model_layer.layers.0"
+            inner = f"{M}.mtp_model_layer.layers"
             mappings += [
                 ReplicatedMapping(f"{M}.enorm.weight", f"{HMTP}.enorm.weight"),
                 ReplicatedMapping(f"{M}.hnorm.weight", f"{HMTP}.hnorm.weight"),
                 AutoMapping(f"{M}.eh_proj.weight", f"{HMTP}.eh_proj.weight"),
                 ReplicatedMapping(f"{M}.final_layernorm.weight", f"{HMTP}.final_layernorm.weight"),
-                *attention(f"{inner}.compute_layer", f"{HMTP}.block"),
-                *shortcut_moe(inner, f"{HMTP}.block"),
             ]
+            if getattr(text, "moe_shortcut_disable_mtp", False):
+                # Attention (layers.0) then MoE (layers.1), each on its own ordinary residual.
+                mappings += [*attention(f"{inner}.0", f"{HMTP}.block"), *moe_layer(f"{inner}.1", f"{HMTP}.block")]
+            else:
+                mappings += [
+                    *attention(f"{inner}.0.compute_layer", f"{HMTP}.block"),
+                    *shortcut_moe(f"{inner}.0", f"{HMTP}.block"),
+                ]
         else:
             mappings.append(
                 _MegatronOnlyStateMapping("language_model.mtp.**", "multi-token prediction (HF config has none)")
@@ -601,7 +622,7 @@ def _validate_hf_config(hf_config) -> None:
         "text_config.mlp_hidden_act": (text.mlp_hidden_act, "relu2"),
         "text_config.gdp_conv_kernel": (text.gdp_conv_kernel, 4),
         "text_config.gdp_norm_eps": (text.gdp_norm_eps, 1e-5),
-        "text_config.residual_in_fp32": (text.residual_in_fp32, False),
+        "text_config.gdp_g_clamp_value": (getattr(text, "gdp_g_clamp_value", None), None),
         "vision_config.hidden_act": (vision.hidden_act, "silu"),
         "vision_config.rope_parameters.rope_theta": (vision.rope_parameters["rope_theta"], 10000.0),
         "projector_hidden_act": (hf_config.projector_hidden_act, "gelu_fast"),

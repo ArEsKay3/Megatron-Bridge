@@ -962,6 +962,9 @@ def _dense_config(config: Nemotron4VLModelProvider) -> MCoreTransformerConfig:
     # would overwrite their layer counts with the language pattern's layer count.
     config.mtp_hsm = False
     config.moe_router_load_balancing_type = "aux_loss"
+    if hasattr(config, "moe_router_qb_bias_space"):
+        # Logit-space bias is valid only with quantile balancing, which the dense configs drop.
+        config.moe_router_qb_bias_space = "score"
     config.expert_model_parallel_size = 1
     config.expert_tensor_parallel_size = 1
     return MCoreTransformerConfig(
