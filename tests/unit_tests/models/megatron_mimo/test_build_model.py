@@ -122,3 +122,36 @@ def test_build_model_forwards_layer_wise_optimizer_flag(monkeypatch, layout_kwar
 
     assert provider.provide_distributed_model.call_args.kwargs["use_layer_wise_distributed_optimizer"] is True
     assert provider.provide_distributed_model.call_args.kwargs["use_layer_wise_param_layout"] is expected_layout
+
+
+@pytest.mark.parametrize(("gtp_size", "egtp_size"), [(1, 1), (2, 1), (1, 2)])
+def test_module_rng_uses_local_weight_shard_groups(monkeypatch, gtp_size, egtp_size):
+    groups = SimpleNamespace(
+        tp=object(),
+        pp=object(),
+        ep=object(),
+        expt_tp=object(),
+        gtp_remat=object(),
+        expt_gtp_remat=object(),
+    )
+    sizes = {groups.gtp_remat: gtp_size, groups.expt_gtp_remat: egtp_size}
+    ranks = {groups.gtp_remat: gtp_size - 1, groups.expt_gtp_remat: egtp_size - 1}
+    grid = SimpleNamespace(is_current_rank_in_grid=lambda: True)
+    infra = SimpleNamespace(module_to_grid_map={"language": grid}, pg_collections={"language": groups})
+    monkeypatch.setattr(dist, "get_rank", lambda: 12)
+    monkeypatch.setattr(dist, "get_group_rank", lambda group, rank: ranks.get(group, 0))
+    monkeypatch.setattr(dist, "get_world_size", lambda group: sizes[group])
+    monkeypatch.setattr(build_model.torch.cuda, "device_count", lambda: 1)
+    seed_fn = MagicMock()
+    monkeypatch.setattr(build_model.tensor_parallel, "model_parallel_cuda_manual_seed", seed_fn)
+    build_model._set_per_module_random_seeds(infra, seed=42)
+    seed_fn.assert_called_once_with(
+        42,
+        tp_rank=0,
+        ep_rank=0,
+        etp_rank=0,
+        gtp_remat_rank=gtp_size - 1,
+        egtp_remat_rank=egtp_size - 1,
+        gtp_remat_world_size=gtp_size,
+        egtp_remat_world_size=egtp_size,
+    )

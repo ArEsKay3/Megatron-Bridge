@@ -1024,3 +1024,47 @@ class TestModalityConfigParallelismAlignment:
         assert injected_projection.params["tp_group"] is pg_collection.tp
         # The source spec is left untouched.
         assert encoder_cfg.tensor_model_parallel_size == 8
+
+
+@pytest.mark.parametrize(("gtp", "egtp"), [(2, 1), (1, 2)])
+def test_mimo_configures_gtp_before_allocating_weights(monkeypatch, gtp, egtp):
+    from megatron.core.tensor_parallel import gtp_api
+
+    from megatron.bridge.models.megatron_mimo import megatron_mimo_provider as module
+
+    config = SimpleNamespace(
+        gtp_weight_remat_size=gtp,
+        expert_gtp_weight_remat_size=egtp,
+        fp4=None,
+        fp8="e4m3",
+        fp8_recipe="mxfp8",
+        calculate_per_token_loss=True,
+    )
+    spec = ModuleSpec(module=Mock, params={"config": config})
+    provider = MegatronMIMOProvider(
+        language_model_spec=spec,
+        megatron_mimo_parallelism_config=MegatronMIMOParallelismConfig(
+            module_parallelisms={"language": ModuleParallelismConfig(data_parallel_size=1)}
+        ),
+    )
+    groups = SimpleNamespace(tp=object(), cp=object(), pp=object())
+    infra = SimpleNamespace(pg_collections={"language": groups}, module_to_grid_map={})
+    monkeypatch.setattr(provider, "_inject_pg_collection_into_language_spec", lambda spec, *a, **k: spec)
+    monkeypatch.setattr(module, "is_pp_first_stage", lambda group: True)
+    monkeypatch.setattr(module, "is_pp_last_stage", lambda group: True)
+    monkeypatch.setattr(gtp_api, "HAVE_GTP", True)
+    configure = Mock()
+    monkeypatch.setattr(gtp_api, "configure_gtp_remat_from_recipe", configure)
+
+    def construct(*args, **kwargs):
+        configure.assert_called_once_with(
+            fp4=False,
+            fp8_recipe="mxfp8",
+            fp8=True,
+            calculate_per_token_loss=True,
+            reduce_scatter_with_fp32_accumulation=False,
+        )
+        return MagicMock()
+
+    monkeypatch.setattr(module, "MimoModel", construct)
+    provider.provide(infra=infra)

@@ -520,6 +520,13 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
         # passed through the standard provider finalization path.
         _finalize_transformer_configs_in_specs(language_spec, modality_specs)
 
+        # MIMO bypasses ModelProviderMixin.provide(); initialize the same GTP
+        # padding and gradient-reduction settings before allocating weight shards.
+        if llm_pg is not None:
+            from megatron.bridge.training.gtp import configure_gtp_remat
+
+            configure_gtp_remat(language_spec.params.get("config"))
+
         # Create MimoModel
         mimo_model_config = MimoModelConfig(
             language_model_spec=language_spec,
@@ -694,6 +701,13 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
             result = final_post_wrap_hook(model_list)
             if result is not None:
                 model_list = result
+
+        from megatron.bridge.training.gtp import classify_gtp_remat_chains
+
+        for model in model_list:
+            language_model = getattr(model, "language_model", None)
+            if language_model is not None:
+                classify_gtp_remat_chains([language_model], get_model_config(language_model))
 
         return model_list
 

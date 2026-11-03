@@ -108,6 +108,8 @@ def _set_per_module_random_seeds(infra: "MegatronMIMOInfra", *, seed: int) -> No
     pp_rank = 0
     ep_rank = 0
     etp_rank = 0
+    gtp_rank = egtp_rank = 0
+    gtp_size = egtp_size = 1
     for module_name, grid in infra.module_to_grid_map.items():
         if grid.is_current_rank_in_grid():
             pg_collection = infra.pg_collections.get(module_name)
@@ -117,6 +119,12 @@ def _set_per_module_random_seeds(infra: "MegatronMIMOInfra", *, seed: int) -> No
             pp_rank = dist.get_group_rank(pg_collection.pp, current_rank)
             ep_rank = dist.get_group_rank(pg_collection.ep, current_rank)
             etp_rank = dist.get_group_rank(pg_collection.expt_tp, current_rank)
+            if getattr(pg_collection, "gtp_remat", None) is not None:
+                gtp_rank = dist.get_group_rank(pg_collection.gtp_remat, current_rank)
+                gtp_size = dist.get_world_size(pg_collection.gtp_remat)
+            if getattr(pg_collection, "expt_gtp_remat", None) is not None:
+                egtp_rank = dist.get_group_rank(pg_collection.expt_gtp_remat, current_rank)
+                egtp_size = dist.get_world_size(pg_collection.expt_gtp_remat)
             break
 
     # Different PP stages get different base seeds — matches the standard path.
@@ -126,7 +134,16 @@ def _set_per_module_random_seeds(infra: "MegatronMIMOInfra", *, seed: int) -> No
     torch.manual_seed(pp_seed)
 
     if torch.cuda.device_count() > 0:
-        tensor_parallel.model_parallel_cuda_manual_seed(pp_seed, tp_rank=tp_rank, ep_rank=ep_rank, etp_rank=etp_rank)
+        tensor_parallel.model_parallel_cuda_manual_seed(
+            pp_seed,
+            tp_rank=tp_rank,
+            ep_rank=ep_rank,
+            etp_rank=etp_rank,
+            gtp_remat_rank=gtp_rank,
+            egtp_remat_rank=egtp_rank,
+            gtp_remat_world_size=gtp_size,
+            egtp_remat_world_size=egtp_size,
+        )
 
 
 def _bridge_parallel_state_globals(local_pg_collection) -> None:
