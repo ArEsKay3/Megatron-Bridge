@@ -83,7 +83,16 @@ def test_set_megatron_mimo_random_seeds_calls_model_parallel_cuda_manual_seed(mo
             _set_per_module_random_seeds(megatron_mimo_infra, seed=42)
 
         # EP=ETP=1 resolves to rank 0/0, preserving dense behavior.
-        mock_seed.assert_called_once_with(42, tp_rank=0, ep_rank=0, etp_rank=0)
+        mock_seed.assert_called_once_with(
+            42,
+            tp_rank=0,
+            ep_rank=0,
+            etp_rank=0,
+            gtp_remat_rank=0,
+            egtp_remat_rank=0,
+            gtp_remat_world_size=1,
+            egtp_remat_world_size=1,
+        )
 
 
 @patch("megatron.bridge.models.megatron_mimo.build_model.dist")
@@ -124,7 +133,16 @@ def test_set_megatron_mimo_random_seeds_offsets_by_pp_rank(mock_dist):
             _set_per_module_random_seeds(megatron_mimo_infra, seed=42)
 
         # seed = 42 + 100 * 1 = 142
-        mock_seed.assert_called_once_with(142, tp_rank=1, ep_rank=2, etp_rank=3)
+        mock_seed.assert_called_once_with(
+            142,
+            tp_rank=1,
+            ep_rank=2,
+            etp_rank=3,
+            gtp_remat_rank=0,
+            egtp_remat_rank=0,
+            gtp_remat_world_size=1,
+            egtp_remat_world_size=1,
+        )
 
 
 def test_bridge_parallel_state_globals_sets_expert_groups_from_pg_collection():
