@@ -168,6 +168,11 @@ class DistributedInitConfig(MTrainDistributedInitConfig):
     enable_megatron_core_experimental: bool = False
     """Enable experimental features for Megatron Core."""
 
+    nccl_comm_cfgs: Optional[dict[str, dict[str, Any]]] = None
+    """Per-group NCCL options keyed by Megatron Core group name, e.g. ``{"ep_dp": {"min_ctas": 16}}``.
+    Applies to the MegatronMIMO process groups. For ``initialize_model_parallel``, use
+    ``nccl_communicator_config_path``."""
+
     use_decentralized_pg: bool = False
     """Use ProcessGroupCollection passed through functions instead of relying on mcore's
     global parallel state (mpu) variables. When True, parallel groups are obtained from

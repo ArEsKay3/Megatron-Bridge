@@ -203,6 +203,7 @@ def setup_megatron_mimo(
         bf16=getattr(cfg.model, "bf16", True),
         seed=cfg.rng.seed,
         use_layer_wise_param_layout=use_layer_wise_param_layout,
+        nccl_comm_cfgs=cfg.dist.nccl_comm_cfgs,
     )
 
     logger.info(f"Rank {dist.get_rank()}: Creating multimodule communicator")

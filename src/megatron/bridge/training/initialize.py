@@ -826,6 +826,8 @@ def _initialize_distributed(
                 if parameter in _init_mp_params:
                     _optional_kwargs[parameter] = getattr(model_config, attribute, 1)
 
+            if dist_config.nccl_comm_cfgs is not None:
+                raise ValueError("nccl_comm_cfgs is not read here; use nccl_communicator_config_path.")
             parallel_state.initialize_model_parallel(
                 tensor_model_parallel_size=model_config.tensor_model_parallel_size,
                 pipeline_model_parallel_size=model_config.pipeline_model_parallel_size,

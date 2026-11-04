@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import random
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 import numpy as np
 import torch
@@ -42,6 +42,7 @@ def build_megatron_mimo_model(
     data_parallel_random_init: bool = True,
     use_layer_wise_distributed_optimizer: bool = False,
     use_layer_wise_param_layout: bool = True,
+    nccl_comm_cfgs: Optional[Dict[str, dict]] = None,
 ) -> tuple["MimoModel", "MegatronMIMOInfra"]:
     """Build a distributed MegatronMIMO model and return ``(model, infra)``.
 
@@ -64,7 +65,7 @@ def build_megatron_mimo_model(
 
     logger.info("Rank %d: Building MIMO infra", dist.get_rank())
     provider.finalize()
-    infra = provider.build_infra()
+    infra = provider.build_infra(nccl_comm_cfgs=nccl_comm_cfgs)
 
     world_size = dist.get_world_size()
     validate_no_stub_ranks(infra.module_to_grid_map, world_size)

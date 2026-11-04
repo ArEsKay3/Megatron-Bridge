@@ -521,6 +521,7 @@ class TestInitializeDistributedBranching:
         mock_dist_config.use_decentralized_pg = False
         mock_dist_config.distributed_timeout_minutes = 30
         mock_dist_config.nccl_communicator_config_path = None
+        mock_dist_config.nccl_comm_cfgs = None
         mock_dist_config.use_tp_pp_dp_mapping = False
         mock_dist_config.use_gloo_process_groups = False
         mock_dist_config.use_sharp = False

@@ -264,7 +264,7 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
             return build_language_model_spec()
         return build_language_model_spec(pp_rank=pp_rank)
 
-    def build_infra(self) -> MegatronMIMOInfra:
+    def build_infra(self, nccl_comm_cfgs: Optional[Dict[str, dict]] = None) -> MegatronMIMOInfra:
         """Build MegatronMIMO parallelism infrastructure.
 
         This method builds HyperCommGrids, ProcessGroupCollections, and topology
@@ -275,13 +275,16 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
         Can be called before or after provide(). Call finalize() first to
         validate the parallelism configuration.
 
+        Args:
+            nccl_comm_cfgs: Optional per-group NCCL options (see ``build_hypercomm_grids``).
+
         Returns:
             MegatronMIMOInfra containing grids, topology, pg_collections,
             and the list of modules this rank participates in.
         """
         num_tokens_broadcast_group = None
         if self.megatron_mimo_parallelism_config is not None:
-            grids = build_hypercomm_grids(self.megatron_mimo_parallelism_config)
+            grids = build_hypercomm_grids(self.megatron_mimo_parallelism_config, nccl_comm_cfgs=nccl_comm_cfgs)
             language_grid = grids.get(MIMO_LANGUAGE_MODULE_KEY)
             set_default_log_ranks({0, language_grid.rank_offset} if language_grid is not None else {0})
             pg_collections = self._get_pg_collections_from_grids(grids)

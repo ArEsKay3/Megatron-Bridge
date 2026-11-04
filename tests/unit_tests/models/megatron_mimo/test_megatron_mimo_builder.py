@@ -163,7 +163,7 @@ class TestBuildHypercommGrids:
         mock_grid = MagicMock()
         create_pg_calls = []
 
-        def track_create_pg(dims, *, view=None):
+        def track_create_pg(dims, *, view=None, pg_options=None):
             create_pg_calls.append((dims, view))
             return MagicMock()
 
@@ -237,6 +237,21 @@ class TestBuildHypercommGrids:
         # Check backend is nccl
         call_kwargs = mock_grid_class.call_args[1]
         assert call_kwargs["backend"] == "nccl"
+
+    @patch("megatron.core.hyper_comm_grid.HyperCommGrid")
+    def test_build_passes_nccl_options_by_group_name(self, mock_grid_class):
+        """nccl_comm_cfgs options reach only the group of that mcore name."""
+        mock_grid = MagicMock()
+        mock_grid_class.return_value = mock_grid
+        megatron_mimo_config = MegatronMIMOParallelismConfig(
+            module_parallelisms={"language": ModuleParallelismConfig(data_parallel_size=2)}
+        )
+
+        build_hypercomm_grids(megatron_mimo_config, nccl_comm_cfgs={"ep_dp": {"min_ctas": 8, "max_ctas": 32}})
+
+        options = {tuple(c.args[0]): c.kwargs["pg_options"] for c in mock_grid.create_pg.call_args_list}
+        assert (options[("expt_dp",)].config.min_ctas, options[("expt_dp",)].config.max_ctas) == (8, 32)
+        assert all(o is None for dims, o in options.items() if dims != ("expt_dp",))
 
     @patch("megatron.core.hyper_comm_grid.HyperCommGrid")
     def test_build_with_rank_offsets(self, mock_grid_class):

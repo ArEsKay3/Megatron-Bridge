@@ -263,7 +263,7 @@ class TestMegatronMIMOProvider:
         infra = provider.build_infra()
 
         # Should build grids
-        mock_build_grids.assert_called_once_with(megatron_mimo_parallelism_config)
+        mock_build_grids.assert_called_once_with(megatron_mimo_parallelism_config, nccl_comm_cfgs=None)
 
         # Should return populated infrastructure
         assert isinstance(infra, MegatronMIMOInfra)
@@ -517,7 +517,7 @@ class TestMegatronMIMOProvider:
         infra = provider.build_infra()
 
         # Should build grids with all three modules
-        mock_build_grids.assert_called_with(megatron_mimo_parallelism_config)
+        mock_build_grids.assert_called_with(megatron_mimo_parallelism_config, nccl_comm_cfgs=None)
 
         # Should have pg_collections for all modules
         assert "language" in infra.pg_collections

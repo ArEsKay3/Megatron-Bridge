@@ -17,6 +17,7 @@ EXPERT_VIEW_NAME = "expert"
 
 def build_hypercomm_grids(
     megatron_mimo_parallelism_config: MegatronMIMOParallelismConfig,
+    nccl_comm_cfgs: Optional[Dict[str, dict]] = None,
 ) -> Dict[str, "HyperCommGrid"]:
     """Create HyperCommGrid objects per module from MegatronMIMO parallelism config.
 
@@ -30,11 +31,16 @@ def build_hypercomm_grids(
 
     Args:
         megatron_mimo_parallelism_config: MegatronMIMOParallelismConfig specifying parallelism per module.
+        nccl_comm_cfgs: Optional per-group NCCL options. Keys are the mcore group names
+            (e.g. ``ep_dp``) and apply to that group of every module.
 
     Returns:
         Dict mapping module names to their HyperCommGrids.
     """
     from megatron.core.hyper_comm_grid import HyperCommGrid
+    from megatron.core.parallel_state import get_nccl_options
+
+    nccl_comm_cfgs = nccl_comm_cfgs or {}
 
     grids: Dict[str, HyperCommGrid] = {}
     for module_name, parallelism in megatron_mimo_parallelism_config.module_parallelisms.items():
@@ -63,27 +69,28 @@ def build_hypercomm_grids(
         )
 
         # Create all required process groups in a stable order on every rank.
-        for dims in (
-            ["tp"],
-            ["cp"],
-            ["pp"],
-            ["dp"],
-            ["dp", "cp"],
-            ["tp", "cp"],
-            ["tp", "pp"],
-            ["tp", "dp", "cp"],
-            ["tp", "cp", "dp", "pp"],
+        # The second item is the mcore group name for the NCCL options.
+        for dims, name in (
+            (["tp"], "tp"),
+            (["cp"], "cp"),
+            (["pp"], "pp"),
+            (["dp"], "dp"),
+            (["dp", "cp"], "dp_cp"),
+            (["tp", "cp"], "tp_cp"),
+            (["tp", "pp"], "mp"),
+            (["tp", "dp", "cp"], "tp_dp_cp"),
+            (["tp", "cp", "dp", "pp"], "intra_dist_opt_instance"),
         ):
-            _ = grid.create_pg(dims)
+            _ = grid.create_pg(dims, pg_options=get_nccl_options(name, nccl_comm_cfgs))
 
-        for dims in (
-            ["ep"],
-            ["expt_tp"],
-            ["expt_dp"],
-            ["expt_tp", "ep"],
-            ["expt_tp", "ep", "pp"],
+        for dims, name in (
+            (["ep"], "ep"),
+            (["expt_tp"], "ep_tp"),
+            (["expt_dp"], "ep_dp"),
+            (["expt_tp", "ep"], "tp_ep_mp"),
+            (["expt_tp", "ep", "pp"], "tp_ep_pp"),
         ):
-            _ = grid.create_pg(dims, view=EXPERT_VIEW_NAME)
+            _ = grid.create_pg(dims, view=EXPERT_VIEW_NAME, pg_options=get_nccl_options(name, nccl_comm_cfgs))
 
         grids[module_name] = grid
 

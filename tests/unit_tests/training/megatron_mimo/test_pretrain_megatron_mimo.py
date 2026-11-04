@@ -394,3 +394,4 @@ def test_setup_megatron_mimo_asserts_when_constructor_fields_missing(
         is cfg.optimizer.use_layer_wise_distributed_optimizer
     )
     assert mock_build_model.call_args.kwargs["use_layer_wise_param_layout"] is expected_layout
+    assert mock_build_model.call_args.kwargs["nccl_comm_cfgs"] is cfg.dist.nccl_comm_cfgs
