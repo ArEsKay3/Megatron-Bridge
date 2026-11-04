@@ -907,6 +907,11 @@ def _make_dense_non_hybrid(config: MCoreTransformerConfig) -> None:
     config.first_last_layers_bf16 = False
     config.num_layers_at_start_in_bf16 = 0
     config.num_layers_at_end_in_bf16 = 0
+    # Activation offloading is a language MoE optimization. The ViT and
+    # projector are dense modules on separate ranks and must not inherit it.
+    config.fine_grained_activation_offloading = False
+    config.fine_grained_offloading_buffer_size_gib = 0.0
+    config.offload_modules = []
     config.mtp_num_layers = None
     config.mtp_use_repeated_layer = False
     config.num_moe_experts = None

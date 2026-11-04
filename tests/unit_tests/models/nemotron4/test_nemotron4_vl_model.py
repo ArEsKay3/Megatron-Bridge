@@ -55,6 +55,9 @@ def test_dense_configs_clear_language_controls_without_changing_language(builder
         first_last_layers_bf16=True,
         num_layers_at_start_in_bf16=2,
         num_layers_at_end_in_bf16=4,
+        fine_grained_activation_offloading=True,
+        fine_grained_offloading_buffer_size_gib=64.0,
+        offload_modules=["fused_group_mlp"],
         vision_num_layers=1,
         vision_hidden_size=64,
         vision_ffn_hidden_size=128,
@@ -75,10 +78,16 @@ def test_dense_configs_clear_language_controls_without_changing_language(builder
     assert not dense_config.first_last_layers_bf16
     assert dense_config.num_layers_at_start_in_bf16 == 0
     assert dense_config.num_layers_at_end_in_bf16 == 0
+    assert not dense_config.fine_grained_activation_offloading
+    assert dense_config.fine_grained_offloading_buffer_size_gib == 0.0
+    assert dense_config.offload_modules == []
     for config in (provider, language_config):
         assert config.first_last_layers_bf16
         assert config.num_layers_at_start_in_bf16 == 2
         assert config.num_layers_at_end_in_bf16 == 4
+        assert config.fine_grained_activation_offloading
+        assert config.fine_grained_offloading_buffer_size_gib == 64.0
+        assert config.offload_modules == ["fused_group_mlp"]
 
 
 def test_provider_exposes_vision_recompute_fields():
