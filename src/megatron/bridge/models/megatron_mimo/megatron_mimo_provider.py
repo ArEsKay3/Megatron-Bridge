@@ -242,6 +242,16 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
             ("context_parallel_size", language_parallelism.context_parallel_size),
             ("expert_model_parallel_size", language_parallelism.expert_model_parallel_size),
             ("expert_tensor_parallel_size", language_parallelism.expert_tensor_parallel_size),
+            ("gtp_weight_remat_size", language_parallelism.gtp_weight_remat_size),
+            ("expert_gtp_weight_remat_size", language_parallelism.expert_gtp_weight_remat_size),
+            (
+                "tensor_parallel_num_weight_shards",
+                language_parallelism.tensor_model_parallel_size * language_parallelism.gtp_weight_remat_size,
+            ),
+            (
+                "expert_tensor_parallel_num_weight_shards",
+                language_parallelism.expert_tensor_parallel_size * language_parallelism.expert_gtp_weight_remat_size,
+            ),
         ):
             if hasattr(standard_provider, attr):
                 setattr(standard_provider, attr, value)
@@ -344,11 +354,6 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
         Returns None for modules this rank doesn't participate in.
         """
         pg_collections: Dict[str, Optional[ProcessGroupCollection]] = {}
-        # One per-rank singleton group serves every module's GTP/EGTP axis (always size 1 here).
-        # Created lazily, only on ranks that build a collection, so grid-only callers and
-        # tests without a default process group are unaffected.
-        gtp_axis_process_groups: Dict[str, torch.distributed.ProcessGroup] = {}
-
         for module_name, grid in grids.items():
             pp_group = grid.get_pg(["pp"])
 
@@ -358,24 +363,12 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
 
             # Only build a full PG collection for ranks that participate in this module.
             if grid.is_current_rank_in_grid():
-                if not gtp_axis_process_groups and torch.distributed.is_initialized():
-                    gtp_axis_singleton = torch.distributed.new_group(
-                        ranks=[torch.distributed.get_rank()], use_local_synchronization=True
-                    )
-                    gtp_axis_process_groups = _get_gtp_remat_axis_group_kwargs(gtp_axis_singleton)
                 first_stage = is_pp_first_stage(pp_group)
                 last_stage = is_pp_last_stage(pp_group)
                 dp_cp_group = grid.get_pg(["dp", "cp"])
                 expt_dp_group = grid.get_pg(["expt_dp"], view=EXPERT_VIEW_NAME)
                 tp_ep_pp_group = grid.get_pg(["expt_tp", "ep", "pp"], view=EXPERT_VIEW_NAME)
 
-                # HyperCommGrid does not define GTP-remat axes, so supported GTP-inclusive
-                # process groups collapse to their existing non-GTP equivalents.
-                gtp_remat_process_groups = _get_gtp_remat_process_group_kwargs(
-                    dp_cp_group,
-                    expt_dp_group,
-                    tp_ep_pp_group,
-                )
                 pg_collections[module_name] = ProcessGroupCollection(
                     tp=grid.get_pg(["tp"]),
                     dp=grid.get_pg(["dp"]),
@@ -387,16 +380,22 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
                     dp_cp=dp_cp_group,
                     intra_dp_cp=dp_cp_group,
                     tp_cp=grid.get_pg(["tp", "cp"]),
-                    tp_dp_cp=grid.get_pg(["tp", "dp", "cp"]),
-                    mp=grid.get_pg(["tp", "pp"]),
+                    tp_dp_cp=grid.get_pg(["tp", "gtp_remat", "dp", "cp"]),
+                    mp=grid.get_pg(["tp", "gtp_remat", "pp"]),
                     tp_ep=grid.get_pg(["expt_tp", "ep"], view=EXPERT_VIEW_NAME),
                     tp_ep_pp=tp_ep_pp_group,
                     intra_expt_dp=expt_dp_group,
-                    intra_dist_opt=grid.get_pg(["tp", "cp", "dp", "pp"]),
+                    intra_dist_opt=grid.get_pg(["tp", "cp", "gtp_remat", "dp", "pp"]),
                     pos_embd=pos_embd_pg if first_stage else None,
                     embd=embd_pg if (first_stage or last_stage) else None,
-                    **gtp_remat_process_groups,
-                    **gtp_axis_process_groups,
+                    gtp_remat=grid.get_pg(["gtp_remat"]),
+                    expt_gtp_remat=grid.get_pg(["expt_gtp_remat"], view=EXPERT_VIEW_NAME),
+                    dp_gtp_remat=grid.get_pg(["gtp_remat", "dp"]),
+                    dp_cp_gtp_remat=grid.get_pg(["gtp_remat", "dp", "cp"]),
+                    expt_dp_gtp_remat=grid.get_pg(["expt_gtp_remat", "expt_dp"], view=EXPERT_VIEW_NAME),
+                    tp_ep_pp_with_egtp_remat=grid.get_pg(
+                        ["expt_tp", "ep", "expt_gtp_remat", "pp"], view=EXPERT_VIEW_NAME
+                    ),
                 )
             else:
                 pg_collections[module_name] = None
@@ -814,9 +813,19 @@ def _align_component_config_parallelism(config: object, pg_collection: ProcessGr
     tp_group = getattr(pg_collection, "tp", None)
     if tp_group is not None and hasattr(config, "tensor_model_parallel_size"):
         config.tensor_model_parallel_size = tp_group.size()
-    for attr in ("expert_model_parallel_size", "expert_tensor_parallel_size"):
+    for attr in (
+        "expert_model_parallel_size",
+        "expert_tensor_parallel_size",
+        "gtp_weight_remat_size",
+        "expert_gtp_weight_remat_size",
+    ):
         if hasattr(config, attr):
             setattr(config, attr, 1)
+    # MCore finalization derives GTP from these public shard counts.
+    if hasattr(config, "tensor_parallel_num_weight_shards"):
+        config.tensor_parallel_num_weight_shards = config.tensor_model_parallel_size
+    if hasattr(config, "expert_tensor_parallel_num_weight_shards"):
+        config.expert_tensor_parallel_num_weight_shards = 1
 
 
 def _build_default_mimo_modality_submodules_spec(standard_provider: object) -> Dict[str, ModuleSpec]:

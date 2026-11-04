@@ -47,12 +47,13 @@ def build_hypercomm_grids(
         shape = [
             parallelism.tensor_model_parallel_size,
             parallelism.context_parallel_size,
+            parallelism.gtp_weight_remat_size,
             parallelism.data_parallel_size,
             parallelism.pipeline_model_parallel_size,
         ]
         grid = HyperCommGrid(
             shape=shape,
-            dim_names=["tp", "cp", "dp", "pp"],
+            dim_names=["tp", "cp", "gtp_remat", "dp", "pp"],
             rank_offset=parallelism.rank_offset,
             backend="nccl",
         )
@@ -61,34 +62,42 @@ def build_hypercomm_grids(
             shape=[
                 parallelism.expert_tensor_parallel_size,
                 parallelism.expert_model_parallel_size,
+                parallelism.expert_gtp_weight_remat_size,
                 parallelism.expert_data_parallel_size,
                 parallelism.pipeline_model_parallel_size,
             ],
-            dim_names=["expt_tp", "ep", "expt_dp", "pp"],
+            dim_names=["expt_tp", "ep", "expt_gtp_remat", "expt_dp", "pp"],
             shared_dims=["pp"],
         )
 
-        # Create all required process groups in a stable order on every rank.
-        # The second item is the mcore group name for the NCCL options.
+        # Use MCore NCCL option names, as in the communicator configuration path.
+        # Optimizer/model groups include GTP; the sample-lane groups do not.
         for dims, name in (
             (["tp"], "tp"),
             (["cp"], "cp"),
             (["pp"], "pp"),
             (["dp"], "dp"),
+            (["gtp_remat"], "gtp_remat"),
+            (["gtp_remat", "dp"], "gtp_remat_dp"),
+            (["gtp_remat", "dp", "cp"], "gtp_remat_dp_cp"),
             (["dp", "cp"], "dp_cp"),
             (["tp", "cp"], "tp_cp"),
-            (["tp", "pp"], "mp"),
-            (["tp", "dp", "cp"], "tp_dp_cp"),
-            (["tp", "cp", "dp", "pp"], "intra_dist_opt_instance"),
+            (["tp", "pp"], None),
+            (["tp", "gtp_remat", "pp"], "mp"),
+            (["tp", "gtp_remat", "dp", "cp"], "tp_dp_cp"),
+            (["tp", "cp", "gtp_remat", "dp", "pp"], "intra_dist_opt_instance"),
         ):
-            _ = grid.create_pg(dims, pg_options=get_nccl_options(name, nccl_comm_cfgs))
+            _ = grid.create_pg(dims, pg_options=get_nccl_options(name, nccl_comm_cfgs) if name is not None else None)
 
         for dims, name in (
             (["ep"], "ep"),
             (["expt_tp"], "ep_tp"),
             (["expt_dp"], "ep_dp"),
+            (["expt_gtp_remat"], "expt_gtp_remat"),
+            (["expt_gtp_remat", "expt_dp"], "ep_gtp_remat_dp"),
             (["expt_tp", "ep"], "tp_ep_mp"),
             (["expt_tp", "ep", "pp"], "tp_ep_pp"),
+            (["expt_tp", "ep", "expt_gtp_remat", "pp"], "tp_ep_gtp_remat_pp"),
         ):
             _ = grid.create_pg(dims, view=EXPERT_VIEW_NAME, pg_options=get_nccl_options(name, nccl_comm_cfgs))
 

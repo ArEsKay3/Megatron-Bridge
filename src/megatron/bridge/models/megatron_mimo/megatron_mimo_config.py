@@ -16,6 +16,9 @@ class ModuleParallelismConfig:
     context_parallel_size: int = 1
     expert_model_parallel_size: int = 1
     expert_tensor_parallel_size: int = 1
+    # Independent weight-shard axes; each dense GTP rank owns a data lane.
+    gtp_weight_remat_size: int = 1
+    expert_gtp_weight_remat_size: int = 1
     data_parallel_size: Optional[int] = None
     rank_offset: int = 0
 
@@ -33,7 +36,14 @@ class ModuleParallelismConfig:
     def total_ranks(self) -> int:
         if self.data_parallel_size is None:
             raise ValueError("data_parallel_size must be set before accessing total_ranks.")
-        return self.dense_model_parallel_size * self.data_parallel_size
+        return self.dense_model_parallel_size * self.batch_parallel_size
+
+    @property
+    def batch_parallel_size(self) -> int:
+        """Independent sample lanes: residual DP times dense GTP."""
+        if self.data_parallel_size is None:
+            raise ValueError("data_parallel_size must be set before accessing batch_parallel_size.")
+        return self.data_parallel_size * self.gtp_weight_remat_size
 
     @property
     def expert_data_parallel_size(self) -> int:
@@ -41,7 +51,10 @@ class ModuleParallelismConfig:
         if self.data_parallel_size is None:
             raise ValueError("data_parallel_size must be set before accessing expert_data_parallel_size.")
         expert_model_parallel_span = (
-            self.expert_tensor_parallel_size * self.expert_model_parallel_size * self.pipeline_model_parallel_size
+            self.expert_tensor_parallel_size
+            * self.expert_model_parallel_size
+            * self.expert_gtp_weight_remat_size
+            * self.pipeline_model_parallel_size
         )
         if self.total_ranks % expert_model_parallel_span != 0:
             raise ValueError(
@@ -57,12 +70,13 @@ class ModuleParallelismConfig:
         if self.data_parallel_size is None:
             if world_size is None or world_size <= 0:
                 raise ValueError("world_size must be provided to compute data_parallel_size.")
-            if world_size % self.dense_model_parallel_size != 0:
+            dense_span = self.dense_model_parallel_size * self.gtp_weight_remat_size
+            if world_size % dense_span != 0:
                 raise ValueError(
                     f"world_size ({world_size}) is not divisible by total_model_parallel_size "
                     f"({self.total_model_parallel_size})."
                 )
-            self.data_parallel_size = world_size // self.dense_model_parallel_size
+            self.data_parallel_size = world_size // dense_span
 
         self._validate_positive_sizes(validate_data_parallel=True)
         self._validate_expert_factorization()
@@ -74,6 +88,8 @@ class ModuleParallelismConfig:
             "context_parallel_size",
             "expert_model_parallel_size",
             "expert_tensor_parallel_size",
+            "gtp_weight_remat_size",
+            "expert_gtp_weight_remat_size",
         )
         if validate_data_parallel:
             fields_to_validate += ("data_parallel_size",)
@@ -89,8 +105,10 @@ class ModuleParallelismConfig:
     def _validate_expert_factorization(self) -> None:
         if self.data_parallel_size is None:
             return
-        dense_token_span = self.tensor_model_parallel_size * self.context_parallel_size * self.data_parallel_size
-        expert_span = self.expert_tensor_parallel_size * self.expert_model_parallel_size
+        dense_token_span = self.tensor_model_parallel_size * self.context_parallel_size * self.batch_parallel_size
+        expert_span = (
+            self.expert_tensor_parallel_size * self.expert_model_parallel_size * self.expert_gtp_weight_remat_size
+        )
         if dense_token_span % expert_span != 0:
             raise ValueError(
                 "TP * CP * DP must be divisible by expert_tensor_parallel_size * "
@@ -160,6 +178,11 @@ class MegatronMIMOParallelismConfig:
         for name, parallelism in self.module_parallelisms.items():
             if name == MIMO_LANGUAGE_MODULE_KEY:
                 continue
+            if parallelism.gtp_weight_remat_size != 1 or parallelism.expert_gtp_weight_remat_size != 1:
+                raise ValueError(
+                    "Encoder GTP/EGTP is not supported; "
+                    f"module '{name}' must have gtp_weight_remat_size=1 and expert_gtp_weight_remat_size=1."
+                )
             if parallelism.expert_model_parallel_size != 1 or parallelism.expert_tensor_parallel_size != 1:
                 raise ValueError(
                     "Encoder modules must remain dense for MegatronMIMO MoE; "
@@ -191,8 +214,8 @@ class MegatronMIMOParallelismConfig:
         module_names = list(self.module_parallelisms.keys())
         for i, name1 in enumerate(module_names):
             for name2 in module_names[i + 1 :]:
-                dp1 = self.module_parallelisms[name1].data_parallel_size
-                dp2 = self.module_parallelisms[name2].data_parallel_size
+                dp1 = self.module_parallelisms[name1].batch_parallel_size
+                dp2 = self.module_parallelisms[name2].batch_parallel_size
                 if dp1 is None or dp2 is None:
                     continue
                 if dp1 % dp2 != 0 and dp2 % dp1 != 0:

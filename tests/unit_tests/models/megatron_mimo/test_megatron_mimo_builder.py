@@ -38,18 +38,18 @@ class TestBuildHypercommGrids:
         assert "language" in grids
         assert grids["language"] == mock_grid
 
-        # Check grid was created with the dense (base) view shape: [tp, cp, dp, pp].
+        # Check grid was created with the dense (base) view shape: [tp, cp, gtp, dp, pp].
         mock_grid_class.assert_called_once()
         call_kwargs = mock_grid_class.call_args[1]
-        assert call_kwargs["shape"] == [2, 1, 2, 2]  # [tp, cp, dp, pp]
-        assert call_kwargs["dim_names"] == ["tp", "cp", "dp", "pp"]
+        assert call_kwargs["shape"] == [2, 1, 1, 2, 2]  # [tp, cp, gtp, dp, pp]
+        assert call_kwargs["dim_names"] == ["tp", "cp", "gtp_remat", "dp", "pp"]
         assert call_kwargs["rank_offset"] == 0
         assert call_kwargs["backend"] == "nccl"
 
         mock_grid.register_view.assert_called_once_with(
             EXPERT_VIEW_NAME,
-            shape=[1, 1, 4, 2],
-            dim_names=["expt_tp", "ep", "expt_dp", "pp"],
+            shape=[1, 1, 1, 4, 2],
+            dim_names=["expt_tp", "ep", "expt_gtp_remat", "expt_dp", "pp"],
             shared_dims=["pp"],
         )
 
@@ -63,7 +63,7 @@ class TestBuildHypercommGrids:
         assert (["ep"], EXPERT_VIEW_NAME) in create_pg_calls
         assert (["expt_tp"], EXPERT_VIEW_NAME) in create_pg_calls
         assert (["expt_dp"], EXPERT_VIEW_NAME) in create_pg_calls
-        assert (["tp", "cp", "dp", "pp"], None) in create_pg_calls
+        assert (["tp", "cp", "gtp_remat", "dp", "pp"], None) in create_pg_calls
         assert (["expt_tp", "ep"], EXPERT_VIEW_NAME) in create_pg_calls
         assert (["expt_tp", "ep", "pp"], EXPERT_VIEW_NAME) in create_pg_calls
 
@@ -134,16 +134,16 @@ class TestBuildHypercommGrids:
         # Check both grids created with different shapes
         assert mock_grid_class.call_count == 2
 
-        # First call (llm): base view [tp, cp, dp, pp] == [8, 1, 1, 2].
+        # First call (llm): base view [tp, cp, gtp, dp, pp] == [8, 1, 1, 1, 2].
         first_call_kwargs = mock_grid_class.call_args_list[0][1]
-        assert first_call_kwargs["shape"] == [8, 1, 1, 2]
-        assert first_call_kwargs["dim_names"] == ["tp", "cp", "dp", "pp"]
+        assert first_call_kwargs["shape"] == [8, 1, 1, 1, 2]
+        assert first_call_kwargs["dim_names"] == ["tp", "cp", "gtp_remat", "dp", "pp"]
         assert first_call_kwargs["rank_offset"] == 0
 
-        # Second call (encoder): base view [2, 1, 2, 1].
+        # Second call (encoder): base view [2, 1, 1, 2, 1].
         second_call_kwargs = mock_grid_class.call_args_list[1][1]
-        assert second_call_kwargs["shape"] == [2, 1, 2, 1]
-        assert second_call_kwargs["dim_names"] == ["tp", "cp", "dp", "pp"]
+        assert second_call_kwargs["shape"] == [2, 1, 1, 2, 1]
+        assert second_call_kwargs["dim_names"] == ["tp", "cp", "gtp_remat", "dp", "pp"]
         assert second_call_kwargs["rank_offset"] == 16
 
     @patch("megatron.core.hyper_comm_grid.HyperCommGrid")
@@ -181,8 +181,8 @@ class TestBuildHypercommGrids:
         assert (["dp", "cp"], None) in create_pg_calls
         assert (["tp", "cp"], None) in create_pg_calls
         assert (["tp", "pp"], None) in create_pg_calls
-        assert (["tp", "dp", "cp"], None) in create_pg_calls
-        assert (["tp", "cp", "dp", "pp"], None) in create_pg_calls
+        assert (["tp", "gtp_remat", "dp", "cp"], None) in create_pg_calls
+        assert (["tp", "cp", "gtp_remat", "dp", "pp"], None) in create_pg_calls
         assert (["ep"], EXPERT_VIEW_NAME) in create_pg_calls
         assert (["expt_tp"], EXPERT_VIEW_NAME) in create_pg_calls
         assert (["expt_dp"], EXPERT_VIEW_NAME) in create_pg_calls
@@ -211,11 +211,11 @@ class TestBuildHypercommGrids:
         build_hypercomm_grids(megatron_mimo_config)
 
         mock_grid_class.assert_called_once()
-        assert mock_grid_class.call_args.kwargs["shape"] == [4, 1, 2, 2]
+        assert mock_grid_class.call_args.kwargs["shape"] == [4, 1, 1, 2, 2]
         mock_grid.register_view.assert_called_once_with(
             EXPERT_VIEW_NAME,
-            shape=[2, 2, 2, 2],
-            dim_names=["expt_tp", "ep", "expt_dp", "pp"],
+            shape=[2, 2, 1, 2, 2],
+            dim_names=["expt_tp", "ep", "expt_gtp_remat", "expt_dp", "pp"],
             shared_dims=["pp"],
         )
 

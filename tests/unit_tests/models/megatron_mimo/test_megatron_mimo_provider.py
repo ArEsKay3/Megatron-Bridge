@@ -907,15 +907,26 @@ class TestProcessGroupCollectionWithEmbeddingGroups:
             (None, ("cp",)): mock_cp,
             (None, ("dp", "cp")): mock_dp_cp,
             (None, ("tp", "cp")): mock_tp_cp,
-            (None, ("tp", "dp", "cp")): mock_tp_dp_cp,
-            (None, ("tp", "pp")): mock_mp,
-            (None, ("tp", "cp", "dp", "pp")): mock_intra_dist_opt,
+            (None, ("tp", "gtp_remat", "dp", "cp")): mock_tp_dp_cp,
+            (None, ("tp", "gtp_remat", "pp")): mock_mp,
+            (None, ("tp", "cp", "gtp_remat", "dp", "pp")): mock_intra_dist_opt,
             ("expert", ("ep",)): mock_ep,
             ("expert", ("expt_tp",)): mock_expt_tp,
             ("expert", ("expt_dp",)): mock_expt_dp,
             ("expert", ("expt_tp", "ep")): mock_tp_ep,
             ("expert", ("expt_tp", "ep", "pp")): mock_tp_ep_pp,
         }
+
+        gtp_groups = {
+            "gtp_remat": (None, ("gtp_remat",)),
+            "expt_gtp_remat": ("expert", ("expt_gtp_remat",)),
+            "dp_gtp_remat": (None, ("gtp_remat", "dp")),
+            "dp_cp_gtp_remat": (None, ("gtp_remat", "dp", "cp")),
+            "expt_dp_gtp_remat": ("expert", ("expt_gtp_remat", "expt_dp")),
+            "tp_ep_pp_with_egtp_remat": ("expert", ("expt_tp", "ep", "expt_gtp_remat", "pp")),
+        }
+        for name, key in gtp_groups.items():
+            pg_map[key] = MagicMock(name=name)
 
         mock_grid = MagicMock()
         mock_grid.rank_offset = 0
@@ -939,16 +950,13 @@ class TestProcessGroupCollectionWithEmbeddingGroups:
         assert pgc.expt_dp == mock_expt_dp
         assert pgc.dp_cp == mock_dp_cp
         assert pgc.intra_dp_cp == mock_dp_cp
-        if "expt_dp_gtp_remat" in pgc.__dataclass_fields__:
-            assert pgc.expt_dp_gtp_remat == mock_expt_dp
-            assert pgc.dp_cp_gtp_remat == mock_dp_cp
+        for name, key in gtp_groups.items():
+            assert getattr(pgc, name) is pg_map[key]
         assert pgc.tp_cp == mock_tp_cp
         assert pgc.tp_dp_cp == mock_tp_dp_cp
         assert pgc.mp == mock_mp
         assert pgc.tp_ep == mock_tp_ep
         assert pgc.tp_ep_pp == mock_tp_ep_pp
-        if "tp_ep_pp_with_egtp_remat" in pgc.__dataclass_fields__:
-            assert pgc.tp_ep_pp_with_egtp_remat == mock_tp_ep_pp
         assert pgc.intra_expt_dp == mock_expt_dp
         assert pgc.intra_dist_opt == mock_intra_dist_opt
 
