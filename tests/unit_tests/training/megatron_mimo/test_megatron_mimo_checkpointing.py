@@ -335,6 +335,7 @@ class TestPretrainMegatronMIMOSetup:
         assert module_config.overlap_param_gather is True
         assert module_config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 is False
 
+    @pytest.mark.parametrize("bridge_spread_fan_in", [False, True])
     @patch("megatron.bridge.training.setup_megatron_mimo.checkpoint_exists", return_value=False)
     @patch("megatron.bridge.training.setup_megatron_mimo.get_active_module_pg")
     @patch("megatron.bridge.training.setup_megatron_mimo.create_checkpoint_manager")
@@ -357,6 +358,7 @@ class TestPretrainMegatronMIMOSetup:
         mock_create_ckpt_mgr,
         mock_get_active_pg,
         mock_ckpt_exists,
+        bridge_spread_fan_in,
     ):
         from megatron.bridge.training.setup_megatron_mimo import setup_megatron_mimo
 
@@ -392,6 +394,7 @@ class TestPretrainMegatronMIMOSetup:
         cfg.model = Mock()
         cfg.model.fp16 = False
         cfg.model.bf16 = True
+        cfg.model.bridge_spread_fan_in = bridge_spread_fan_in
         from megatron.bridge.training.config import OptimizerConfig
 
         cfg.optimizer = OptimizerConfig(bf16=True, use_distributed_optimizer=True)
@@ -412,6 +415,7 @@ class TestPretrainMegatronMIMOSetup:
         mock_optimizer.module_infos = {}
         start_time_tensor = Mock()
         start_time_tensor.item.return_value = global_state.start_time
+        shape_fns = {"images": Mock()} if bridge_spread_fan_in else None
 
         with (
             patch("megatron.bridge.models.megatron_mimo.build_megatron_mimo_model", return_value=(model, infra)),
@@ -426,15 +430,24 @@ class TestPretrainMegatronMIMOSetup:
             patch("megatron.core.parallel_state._DATA_PARALLEL_GROUP_WITH_CP", None),
             patch("torch.tensor", return_value=start_time_tensor),
         ):
-            result = setup_megatron_mimo(state=global_state)
+            result = setup_megatron_mimo(state=global_state, bridge_recv_shape_fns=shape_fns)
 
         mock_create_ckpt_mgr.assert_called_once_with(cfg.checkpoint)
+        # Off: the communicator call is unchanged (no new keyword for an older MCore).
+        spread_kwarg = mock_communicator.call_args.kwargs.get("bridge_spread_fan_in")
+        assert spread_kwarg is (True if bridge_spread_fan_in else None)
+        assert mock_communicator.call_args.kwargs["bridge_recv_shape_fns"] is shape_fns
         optimizer_config = mock_get_mimo_optimizer.call_args.args[1]
         assert type(optimizer_config).__module__ == "megatron.core.optimizer.optimizer_config"
         assert optimizer_config.use_distributed_optimizer is True
         assert optimizer_config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 is False
         global_state.initialize_async_checkpoint_worker.assert_called_once()
         assert result.checkpoint_manager is mock_mgr_instance
+
+    def test_mcore_communicator_accepts_bridge_spread_fan_in(self):
+        from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
+
+        assert "bridge_spread_fan_in" in inspect.signature(MultiModulePipelineCommunicator).parameters
 
     def test_pretrain_megatron_mimo_calls_runtime_config_update(self):
         """pretrain_megatron_mimo should call megatron_mimo_runtime_config_update before setup."""

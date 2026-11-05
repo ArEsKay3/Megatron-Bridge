@@ -166,6 +166,9 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
     # If None, auto-derived: language module → 3, all others → 2.
     module_output_ndim: Optional[Dict[str, int]] = None
 
+    # Receive each encoder -> language fan-in on several ranks of a language replica (bitwise the same).
+    bridge_spread_fan_in: bool = False
+
     # Cached grids after build_model() - used by data loading
     _grids: Optional[Dict[str, "HyperCommGrid"]] = field(default=None, repr=False)
 

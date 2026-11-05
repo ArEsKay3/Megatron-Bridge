@@ -141,6 +141,7 @@ def setup_megatron_mimo(
     *,
     use_layer_wise_param_layout: bool = True,
     model_init_fn: Optional[Callable] = None,
+    bridge_recv_shape_fns: Optional[Dict[str, Callable]] = None,
 ) -> MegatronMIMOSetupOutput:
     """MegatronMIMO-specific setup helper.
 
@@ -164,6 +165,9 @@ def setup_megatron_mimo(
         use_layer_wise_param_layout: With ``cfg.optimizer.use_layer_wise_distributed_optimizer``,
             use shard-aligned DDP buffers. False keeps the default DDP buffers (compact
             layer-wise optimizer), as ``use_layer_wise_param_layout`` does for ``get_model``.
+        bridge_recv_shape_fns: Optional per-encoder callbacks that derive the bridge shapes
+            from each micro-batch, passed to ``MultiModulePipelineCommunicator``. A bridge with
+            a callback skips its shape exchange.
 
     Returns:
         MegatronMIMOSetupOutput containing all components for training.
@@ -225,12 +229,16 @@ def setup_megatron_mimo(
         else:
             model_config.pipeline_dtype = torch.float32
 
+    # Pass the option only when set, so the default works with an MCore that predates it.
+    spread_kwargs = {"bridge_spread_fan_in": True} if megatron_mimo_provider.bridge_spread_fan_in else {}
     multimodule_communicator = MultiModulePipelineCommunicator(
         megatron_mimo_infra.module_to_grid_map,
         megatron_mimo_infra.topology,
         model_config,
         dim_mapping={"s": 0, "b": 1, "h": 2},  # SBH mapping - matches MimoModel output
         module_output_ndim=megatron_mimo_infra.module_output_ndim,
+        bridge_recv_shape_fns=bridge_recv_shape_fns,
+        **spread_kwargs,
     )
 
     # Build pg_collection for schedule
