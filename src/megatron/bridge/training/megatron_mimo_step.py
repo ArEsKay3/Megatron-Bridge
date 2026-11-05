@@ -117,7 +117,7 @@ def reduce_mimo_losses(
     losses_reduced: list[dict[str, torch.Tensor]],
     llm_pg: ProcessGroupCollection | None,
 ) -> dict[str, torch.Tensor]:
-    """Aggregate MIMO language losses across microbatches and language DP/CP."""
+    """Aggregate MIMO language losses across microbatches and all DP/CP/GTP tokens."""
     loss_dict: dict[str, torch.Tensor] = {}
     if not losses_reduced:
         return loss_dict
@@ -126,8 +126,12 @@ def reduce_mimo_losses(
         values = [metrics[name].view(-1) for metrics in losses_reduced]
         if values[0].numel() == 2:
             reduced = torch.vstack(values).sum(dim=0)
-            if llm_pg is not None and llm_pg.dp_cp is not None:
-                torch.distributed.all_reduce(reduced, group=llm_pg.dp_cp)
+            if llm_pg is not None:
+                data_group = getattr(llm_pg, "dp_cp_gtp_remat", None)
+                if data_group is None:
+                    data_group = llm_pg.dp_cp
+                if data_group is not None:
+                    torch.distributed.all_reduce(reduced, group=data_group)
             loss_dict[name] = torch.where(reduced[1] > 0, reduced[0] / reduced[1], torch.zeros_like(reduced[0]))
         elif values[0].numel() == 1:
             loss_dict[name] = torch.cat(values).mean()

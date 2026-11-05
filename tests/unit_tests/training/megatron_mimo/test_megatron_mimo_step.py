@@ -554,3 +554,23 @@ def test_mimo_train_step_token_weighted_loss(local, remote, expected):
         )
     assert result[0]["lm loss"].item() == pytest.approx(expected)
     assert reduction.call_args_list[0].kwargs["group"] is dp_cp
+
+
+@pytest.mark.parametrize("gtp_group_state", ["present", "none", "absent"])
+def test_reduce_mimo_losses_weights_all_data_lanes(monkeypatch, gtp_group_state):
+    dp_cp, all_lanes = object(), object()
+    groups = SimpleNamespace(dp_cp=dp_cp)
+    if gtp_group_state != "absent":
+        groups.dp_cp_gtp_remat = all_lanes if gtp_group_state == "present" else None
+    expected_group = all_lanes if gtp_group_state == "present" else dp_cp
+
+    def reduce(tensor, *, group):
+        assert group is expected_group
+        # Local microbatches: 10 / 3. Remote lane: 18 / 9.
+        # The global token mean is 28 / 12, not the mean of lane means.
+        tensor.add_(torch.tensor([18.0, 9.0]))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+    losses = [{"lm loss": torch.tensor([4.0, 1.0])}, {"lm loss": torch.tensor([6.0, 2.0])}]
+    result = reduce_mimo_losses(losses, groups)
+    assert result["lm loss"].item() == pytest.approx(28.0 / 12.0)
