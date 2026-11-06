@@ -1358,7 +1358,15 @@ class TestSetupMegatronMIMOCheckpointLoading:
         "megatron.core.parallel_state._DATA_PARALLEL_GROUP_WITH_CP",
     ]
 
-    def _run_setup(self, *, load_path=None, checkpoint_exists_return=False, checkpoint_manager=None):
+    def _run_setup(
+        self,
+        *,
+        load_path=None,
+        checkpoint_exists_return=False,
+        checkpoint_manager=None,
+        model_config=None,
+        module_names=("language",),
+    ):
         """Run setup_megatron_mimo with mocks, return dict of mock handles."""
         from megatron.bridge.training.setup_megatron_mimo import setup_megatron_mimo
 
@@ -1389,7 +1397,7 @@ class TestSetupMegatronMIMOCheckpointLoading:
         cfg._calculate_scheduler_steps = Mock()
 
         infra = Mock()
-        infra.module_to_grid_map = {"language": Mock()}
+        infra.module_to_grid_map = {name: Mock() for name in module_names}
         infra.topology = Mock()
         infra.module_output_ndim = {"language": 3}
         infra.pg_collections = {"language": Mock()}
@@ -1413,7 +1421,9 @@ class TestSetupMegatronMIMOCheckpointLoading:
                 if "._" in p.split(".")[-1]:
                     stack.enter_context(patch(p, None))
                 else:
-                    stack.enter_context(patch(p))
+                    handle = stack.enter_context(patch(p))
+                    if p.endswith(".MultiModulePipelineCommunicator"):
+                        mocks["communicator"] = handle
 
             m_dist = stack.enter_context(patch("megatron.bridge.training.setup_megatron_mimo.dist"))
             m_dist.get_rank.return_value = 0
@@ -1444,7 +1454,8 @@ class TestSetupMegatronMIMOCheckpointLoading:
                 patch("megatron.bridge.models.megatron_mimo.build_megatron_mimo_model", return_value=(model, infra))
             )
 
-            model_config = Mock(pipeline_dtype=None, bf16=True)
+            if model_config is None:
+                model_config = Mock(pipeline_dtype=None, bf16=True, fp32_residual_connection=False)
             stack.enter_context(
                 patch("megatron.bridge.training.setup_megatron_mimo.get_model_config", return_value=model_config)
             )
@@ -1460,6 +1471,32 @@ class TestSetupMegatronMIMOCheckpointLoading:
             mocks["result"] = result
 
         return mocks
+
+    @pytest.mark.parametrize(
+        "fp32_residual,bf16,module_names,expected_override",
+        [
+            (True, True, ("images", "language"), True),
+            (False, True, ("images", "language"), False),
+            (True, False, ("images", "language"), False),
+            (True, True, ("language",), False),
+        ],
+    )
+    def test_image_bridge_dtype_with_fp32_residuals(
+        self, fp32_residual, bf16, module_names, expected_override
+    ):
+        import torch
+
+        model_config = Mock(
+            pipeline_dtype=torch.float32 if fp32_residual else torch.bfloat16,
+            bf16=bf16,
+            fp32_residual_connection=fp32_residual,
+        )
+        mocks = self._run_setup(model_config=model_config, module_names=module_names)
+        kwargs = mocks["communicator"].call_args.kwargs
+        if expected_override:
+            assert kwargs["bridge_comm_dtypes"] == {"images": torch.bfloat16}
+        else:
+            assert "bridge_comm_dtypes" not in kwargs
 
     def test_load_invoked_when_persistent_checkpoint_exists(self):
         mocks = self._run_setup(load_path="/tmp/ckpt", checkpoint_exists_return=True)

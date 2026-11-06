@@ -230,7 +230,15 @@ def setup_megatron_mimo(
             model_config.pipeline_dtype = torch.float32
 
     # Pass the option only when set, so the default works with an MCore that predates it.
-    spread_kwargs = {"bridge_spread_fan_in": True} if megatron_mimo_provider.bridge_spread_fan_in else {}
+    comm_kwargs = {"bridge_spread_fan_in": True} if megatron_mimo_provider.bridge_spread_fan_in else {}
+    # FP32 residuals change the language pipeline dtype, while vision still emits BF16.
+    # Keep the image bridge's send/receive buffers aligned with the encoder output.
+    if (
+        getattr(model_config, "fp32_residual_connection", False)
+        and getattr(model_config, "bf16", False)
+        and "images" in megatron_mimo_infra.module_to_grid_map
+    ):
+        comm_kwargs["bridge_comm_dtypes"] = {"images": torch.bfloat16}
     multimodule_communicator = MultiModulePipelineCommunicator(
         megatron_mimo_infra.module_to_grid_map,
         megatron_mimo_infra.topology,
@@ -238,7 +246,7 @@ def setup_megatron_mimo(
         dim_mapping={"s": 0, "b": 1, "h": 2},  # SBH mapping - matches MimoModel output
         module_output_ndim=megatron_mimo_infra.module_output_ndim,
         bridge_recv_shape_fns=bridge_recv_shape_fns,
-        **spread_kwargs,
+        **comm_kwargs,
     )
 
     # Build pg_collection for schedule
