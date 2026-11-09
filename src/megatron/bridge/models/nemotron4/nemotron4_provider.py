@@ -190,20 +190,22 @@ def require_nemotron4_ssa_mcore() -> None:
         )
 
 
-def nemotron4_ssa_stack_spec() -> ModuleSpec:
+def nemotron4_ssa_stack_spec(config: Any = None) -> ModuleSpec:
     """Return the gated-delta-product stack spec with simplified sparse attention.
 
     Identical to :func:`nemotron4_stack_spec` except that every attention layer (including the
     MTP block's) is MCore's ``SimplifiedSparseAttention``: ordinary GQA projections whose core
     attention attends to each query's top-k keys chosen by a learned single-head indexer.
+    ``config`` selects the variant as in :func:`nemotron4_stack_spec`:
+    ``transformer_impl='inference_optimized'`` uses ``gdp_ssa_inference_stack_spec``.
     A named function (not a lambda) so the provider stays serializable.
     """
     require_nemotron4_ssa_mcore()
-    from megatron.core.transformer.experimental_attention_variant.simplified_sparse_attention_layer_specs import (
-        gdp_ssa_stack_spec,
+    return _resolve_nemotron4_spec_variant(
+        "megatron.core.transformer.experimental_attention_variant.simplified_sparse_attention_layer_specs",
+        "gdp_ssa_stack_spec",
+        config,
     )
-
-    return gdp_ssa_stack_spec
 
 
 def nemotron4_nano_wide_residual() -> Any:
