@@ -209,6 +209,36 @@ class TestMegatronMIMOProviderFactory:
         assert loaded_provider.modality_submodules_spec
         assert loaded_provider.special_token_ids == {"images": language_provider.image_token_id}
 
+    def test_load_model_config_rebuilds_specs_a_training_save_kept(self, tmp_path):
+        """A training checkpoint keeps the derived specs; load_model_config rebuilds them instead."""
+        from megatron.bridge.training.model_load_save import load_model_config
+
+        language_provider = _make_language_provider()
+        provider = MegatronMIMOProvider.from_standard_provider(
+            standard_provider=language_provider,
+            megatron_mimo_parallelism_config=_make_parallelism_config(),
+        )
+        model_dict = ConfigContainer._convert_value_to_dict(provider)
+        # The shapes an NM4 training save wrote, which instantiate() cannot rebuild.
+        model_dict["language_model_spec"] = {
+            "_target_": "megatron.core.transformer.spec_utils.ModuleSpec",
+            "module": {"_target_": "megatron.core.transformer.mlp.MLP", "_call_": False},
+            "submodules": {"_target_": "megatron.core.transformer.mlp.MLPSubmodules", "_call_": True},
+        }
+        model_dict["modality_submodules_spec"] = {
+            "images": {"_target_": "megatron.core.transformer.mlp.MLPSubmodules", "_call_": True}
+        }
+        with safe_yaml_representers():
+            (tmp_path / "run_config.yaml").write_text(yaml.safe_dump({"model": model_dict}))
+
+        loaded_provider, _ = load_model_config(str(tmp_path))
+
+        assert isinstance(loaded_provider, MegatronMIMOProvider)
+        assert isinstance(loaded_provider.standard_provider, Qwen35VLModelProvider)
+        assert isinstance(loaded_provider.language_model_spec, ModuleSpec)
+        assert loaded_provider.modality_submodules_spec["images"].module is VisionModalitySubmodules
+        assert loaded_provider.special_token_ids == {"images": language_provider.image_token_id}
+
     def test_from_standard_provider_requires_language_model_spec_api(self):
         with pytest.raises(TypeError, match="build_language_model_spec"):
             MegatronMIMOProvider.from_standard_provider(
