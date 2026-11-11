@@ -2240,7 +2240,7 @@ def _align_mimo_model_sharded_keys(
     *,
     checkpoint_name: str,
     module_name: str,
-) -> None:
+) -> Optional[dict[str, Any]]:
     """Map runtime MIMO wrapper keys onto the checkpoint's wrapper layout.
 
     Megatron-LM training wraps each active component as
@@ -2248,6 +2248,9 @@ def _align_mimo_model_sharded_keys(
     constructs an unwrapped component. MCore records those wrapper levels in
     MIMO sharded keys. Keep the runtime dictionary keys unchanged for
     ``load_state_dict`` and change only the distributed-checkpoint lookup keys.
+
+    Returns the checkpoint's sharded metadata when it was read, so later
+    filters do not read it again, else ``None``.
     """
     model_state = sharded_state_dict.get("model")
     if not isinstance(model_state, dict):
@@ -2258,7 +2261,7 @@ def _align_mimo_model_sharded_keys(
         module_name=module_name,
     )
     if runtime_prefix is None:
-        return
+        return None
     checkpoint_metadata = TorchDistLoadShardedStrategy().load_sharded_metadata(Path(checkpoint_name))
     checkpoint_prefix = _mimo_component_wrapper_prefix(
         set(checkpoint_metadata),
@@ -2271,15 +2274,158 @@ def _align_mimo_model_sharded_keys(
             checkpoint_name,
             module_name,
         )
-        return
+        return checkpoint_metadata
     if runtime_prefix == checkpoint_prefix:
-        return
+        return checkpoint_metadata
 
     apply_prefix_mapping(model_state, {runtime_prefix: checkpoint_prefix})
     print_rank_0(
         f"Mapped MIMO checkpoint component {module_name!r} from runtime prefix "
         f"{runtime_prefix!r} to stored prefix {checkpoint_prefix!r}"
     )
+    return checkpoint_metadata
+
+
+_VIDEO_PATCH_EMBED = "video_patch_embed"
+_IMAGE_PATCH_EMBED = "patch_embed"
+
+
+def _video_patch_embed_encoders(model: list[MegatronModule]) -> list[torch.nn.Module]:
+    """Encoders in ``model`` that own a video patch embedder (video temporal compression, T > 1).
+
+    Duck-typed on the Nemotron4 MIMO vision encoder attributes, so this module does not import a model family.
+    """
+    encoders = []
+    for chunk in model:
+        if not isinstance(chunk, torch.nn.Module):
+            continue
+        for module in chunk.modules():
+            temporal = getattr(module, "video_temporal_patch_size", 1)
+            if (
+                isinstance(temporal, int)
+                and temporal > 1
+                and isinstance(getattr(module, _VIDEO_PATCH_EMBED, None), torch.nn.Module)
+            ):
+                encoders.append(module)
+    return encoders
+
+
+def _run_config_video_temporal_patch_sizes(config: Any) -> set[int]:
+    """Every ``video_temporal_patch_size`` value in a (nested) run_config section."""
+    found: set[int] = set()
+    stack = [config]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, Mapping):
+            for key, value in node.items():
+                if key == "video_temporal_patch_size" and isinstance(value, int) and not isinstance(value, bool):
+                    found.add(value)
+                else:
+                    stack.append(value)
+        elif isinstance(node, (list, tuple)):
+            stack.extend(node)
+    return found
+
+
+def _image_patch_embed_key(video_key: str) -> str:
+    """The ``patch_embed`` key next to a ``video_patch_embed`` key (last occurrence)."""
+    parts = video_key.split(".")
+    index = len(parts) - 1 - parts[::-1].index(_VIDEO_PATCH_EMBED)
+    parts[index] = _IMAGE_PATCH_EMBED
+    return ".".join(parts)
+
+
+def _drop_missing_video_patch_embed_keys(
+    sharded_state_dict: dict[str, Any],
+    model: list[MegatronModule],
+    *,
+    checkpoint_name: str,
+    finetune: bool,
+    run_config: Optional[Mapping[str, Any]],
+    checkpoint_metadata: Optional[Mapping[str, Any]] = None,
+    load_main_params_from_ckpt: bool = False,
+) -> list[str]:
+    """Let a checkpoint saved without video temporal compression initialize a model with it.
+
+    A model with video temporal compression (T > 1) owns a ``video_patch_embed`` that a checkpoint saved with
+    T = 1 does not have. The model requests it, and the default dist-ckpt strictness raises on a requested key
+    that the checkpoint lacks, before any ``load_state_dict`` hook runs. On a finetune load
+    (``pretrained_checkpoint``), this drops exactly those ``video_patch_embed`` keys from the request and logs
+    each one. The encoder's ``load_state_dict`` pre-hook then derives the weight from the loaded ``patch_embed``
+    weight inside ``_load_model_state_dict``. On the default branch, ``optimizer.reload_model_params()`` runs
+    after that and copies the model weights (with the derived one) into the FP32 main params. A finetune load
+    builds a fresh optimizer, so the new weight has no optimizer state to load.
+
+    With ``load_main_params_from_ckpt``, the main params come from the loaded checkpoint dict, not from the
+    model, and that dict never gets the derived weight. So this raises when it would drop a key.
+
+    Only ``video_patch_embed`` keys absent from the checkpoint are dropped; every other key keeps the load's
+    strictness. This raises instead of dropping when an encoder has ``temporal_ckpt_compat`` off, when the
+    checkpoint's run_config declares T > 1 (it claims a trained module but lost it), or when the checkpoint
+    has no ``patch_embed`` weight to derive from, or when ``load_main_params_from_ckpt`` is set. A resume
+    (``finetune=False``) is left unchanged: it cannot change T.
+
+    Returns the dropped runtime keys.
+    """
+    if not finetune:
+        return []
+    encoders = _video_patch_embed_encoders(model)
+    if not encoders:
+        return []
+    if checkpoint_metadata is None:
+        checkpoint_metadata = TorchDistLoadShardedStrategy().load_sharded_metadata(Path(checkpoint_name))
+    stored = set(checkpoint_metadata)
+
+    missing: list[tuple[dict[str, Any], str, str]] = []
+    for section, state in sharded_state_dict.items():
+        if not _is_model_section(section) or not isinstance(state, dict):
+            continue
+        for runtime_key, value in state.items():
+            if _VIDEO_PATCH_EMBED not in runtime_key.split("."):
+                continue
+            checkpoint_key = getattr(value, "key", None)
+            if isinstance(checkpoint_key, str) and checkpoint_key not in stored:
+                missing.append((state, runtime_key, checkpoint_key))
+    if not missing:
+        return []
+
+    missing_keys = [checkpoint_key for _, _, checkpoint_key in missing]
+    if not all(getattr(encoder, "temporal_ckpt_compat", False) for encoder in encoders):
+        raise RuntimeError(
+            f"Checkpoint {checkpoint_name} has no {missing_keys}: it was saved without video temporal "
+            "compression. To derive the video patch embedder from the image patch embedder, enable the lazy "
+            "init (temporal_ckpt_compat; in NeMo RL policy.video_temporal_compression.init_missing_video_embedder)."
+        )
+    declared = sorted(t for t in _run_config_video_temporal_patch_sizes((run_config or {}).get("model")) if t > 1)
+    if declared:
+        raise RuntimeError(
+            f"Checkpoint {checkpoint_name} declares video_temporal_patch_size={declared} in its run_config but "
+            f"has no {missing_keys}. It claims a trained video patch embedder but lost it, so it is not derived "
+            "from the image patch embedder."
+        )
+    no_image = [key for key in missing_keys if _image_patch_embed_key(key) not in stored]
+    if no_image:
+        raise RuntimeError(
+            f"Checkpoint {checkpoint_name} has neither {no_image} nor the matching patch_embed weight, so the "
+            "video patch embedder cannot be derived."
+        )
+    if load_main_params_from_ckpt:
+        raise RuntimeError(
+            f"Checkpoint {checkpoint_name} has no {missing_keys}, and checkpoint.load_main_params_from_ckpt is set. "
+            "The main params would come from the checkpoint dict, which has no derived video patch embedder. "
+            "Set load_main_params_from_ckpt=False so the main params are copied from the model weights."
+        )
+
+    for state, runtime_key, checkpoint_key in missing:
+        del state[runtime_key]
+        logger.warning(
+            "Checkpoint %s has no %s (saved without video temporal compression); not loading it. The encoder "
+            "derives %s from the loaded patch_embed weight (temporal_ckpt_compat, finetune load).",
+            checkpoint_name,
+            checkpoint_key,
+            runtime_key,
+        )
+    return [runtime_key for _, runtime_key, _ in missing]
 
 
 def generate_state_dict(
@@ -3240,11 +3386,25 @@ def _load_checkpoint_from_path(
                 pg_collection=pg_collection,
             )
 
+            checkpoint_metadata = None
             if module_name is not None and ckpt_type != CheckpointType.LOCAL:
-                _align_mimo_model_sharded_keys(
+                checkpoint_metadata = _align_mimo_model_sharded_keys(
                     load_kwargs["sharded_state_dict"],
                     checkpoint_name=checkpoint_name,
                     module_name=module_name,
+                )
+            if ckpt_type != CheckpointType.LOCAL:
+                # Runs after the MIMO key mapping, so it compares stored keys. A dropped video_patch_embed key
+                # is derived by the encoder's load_state_dict hook below, before reload_model_params() copies
+                # the model weights into the main params (load_main_params_from_ckpt is rejected).
+                _drop_missing_video_patch_embed_keys(
+                    load_kwargs["sharded_state_dict"],
+                    model,
+                    checkpoint_name=checkpoint_name,
+                    finetune=cfg.checkpoint.finetune,
+                    run_config=run_config,
+                    checkpoint_metadata=checkpoint_metadata,
+                    load_main_params_from_ckpt=bool(cfg.checkpoint.load_main_params_from_ckpt),
                 )
 
     elif ckpt_format == "fsdp_dtensor":

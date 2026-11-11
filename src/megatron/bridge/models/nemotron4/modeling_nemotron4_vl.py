@@ -52,7 +52,8 @@ from megatron.core.models.multimodal.context_parallel import (
     split_to_context_parallel_ranks_dynamic_res,
 )
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
-from megatron.core.models.vision.vit_model import ViTModel
+from megatron.core.models.vision.vit_model import PatchEmbedding, ViTModel
+from megatron.core.models.vision.vit_utils import dynamic_patch_grid_lists, run_vision_transformer
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
@@ -141,6 +142,37 @@ def _build_vision_packed_seq_params(imgs_sizes: torch.Tensor, patch_dim: int, de
     )
 
 
+SUPPORTED_VIDEO_TEMPORAL_PATCH_SIZES = (1, 2)
+
+
+def check_video_temporal_compression(video_temporal_patch_size: int, separate_video_embedder: bool) -> None:
+    """Reject video tubelet settings the Nemotron4 vision encoder does not implement.
+
+    ``separate_video_embedder`` has no effect with T = 1, so it is checked only for T > 1.
+    """
+    if video_temporal_patch_size not in SUPPORTED_VIDEO_TEMPORAL_PATCH_SIZES:
+        raise ValueError(
+            f"Nemotron4 supports video_temporal_patch_size in {SUPPORTED_VIDEO_TEMPORAL_PATCH_SIZES}, "
+            f"got {video_temporal_patch_size!r}."
+        )
+    if video_temporal_patch_size > 1 and not separate_video_embedder:
+        raise ValueError(
+            "Nemotron4 supports only separate_video_embedder=True: images keep patch_embed and video "
+            "tubelets use their own video_patch_embed."
+        )
+
+
+def video_patch_weight_from_image(image_weight: torch.Tensor, temporal_patch_size: int) -> torch.Tensor:
+    """Derive the tubelet patch-embedding weight from the image patch-embedding weight.
+
+    ``image_weight`` is the Conv2d weight ``[hidden, 3, P, P]``. The result is ``[hidden, 3 * T, P, P]``, and its
+    input channel ``t * 3 + c`` is channel ``c`` of frame ``t`` (frame-major). Each frame gets ``W / T``, so by
+    linearity a tubelet embeds as the image embedding of its mean frame, and a tubelet of ``T`` identical frames
+    embeds as that frame.
+    """
+    return torch.cat([image_weight / temporal_patch_size] * temporal_patch_size, dim=1)
+
+
 class _WithoutTEExtraState:
     """Exclude TE metadata absent from the native NM4 checkpoints, as :class:`Nemotron4VLModel` does."""
 
@@ -156,11 +188,98 @@ class Nemotron4MIMOVisionEncoder(_WithoutTEExtraState, ViTModel):
     """Pixtral-style ViT of the MIMO ``images`` module.
 
     With ``recompute_budget_gib``, each training forward sets its recompute plan (see ``recompute_plan``).
+
+    With ``video_temporal_patch_size`` T > 1, the encoder also owns ``video_patch_embed``, a Conv2d over ``3 * T``
+    channels. The frames of each video are grouped into tubelets of T consecutive frames, which go through
+    ``video_patch_embed``; images keep ``patch_embed``. Everything after the embedding (``ln_pre``, 2D RoPE, the
+    transformer and the merger) sees one ``imgs_sizes`` row per image or tubelet. With T = 1 the module and its
+    forward are those of the plain ViT.
     """
 
-    def __init__(self, *args, recompute_budget_gib: float | None = None, **kwargs) -> None:
+    # Class defaults keep encoders built without ``__init__`` on the T = 1 path.
+    video_temporal_patch_size: int = 1
+    padded_video_count: int = 0
+    warned_frames_as_images: bool = False
+
+    def __init__(
+        self,
+        *args,
+        recompute_budget_gib: float | None = None,
+        video_temporal_patch_size: int = 1,
+        separate_video_embedder: bool = True,
+        temporal_ckpt_compat: bool = False,
+        **kwargs,
+    ) -> None:
+        check_video_temporal_compression(video_temporal_patch_size, separate_video_embedder)
         super().__init__(*args, **kwargs)
         self.recompute_budget_gib = recompute_budget_gib
+        self.video_temporal_patch_size = video_temporal_patch_size
+        # Lazy-init flag (``--allow-checkpoint-without-temporal-compression``). The HF import applies it in
+        # ``Nemotron4Bridge``; ``_fill_missing_video_patch_embed`` applies it to ``load_state_dict``.
+        self.temporal_ckpt_compat = temporal_ckpt_compat
+        if video_temporal_patch_size > 1:
+            # Names of the T = 1 weights, recorded before adapters can wrap any module. The load hook uses them
+            # to tell a full encoder state dict from an adapter-only one.
+            self._base_parameter_names = tuple(name for name, _ in self.named_parameters())
+            # Built last, so the modules above keep their T = 1 parameter order.
+            self.video_patch_embed = self._build_video_patch_embed()
+            self._register_load_state_dict_pre_hook(self._fill_missing_video_patch_embed)
+
+    def _build_video_patch_embed(self) -> PatchEmbedding:
+        """Build ``video_patch_embed``, initialized from ``patch_embed`` without drawing random numbers."""
+        image_proj = self.patch_embed.proj
+        if image_proj.bias is not None:
+            raise ValueError("Nemotron4 video_patch_embed expects a patch embedding without bias.")
+        temporal = self.video_temporal_patch_size
+        # Meta construction skips the Conv2d random init, so T > 1 does not shift the RNG stream of the modules
+        # built after the encoder. A checkpoint or HF import overwrites the start value.
+        with torch.device("meta"):
+            video = PatchEmbedding(image_proj.in_channels * temporal, image_proj.out_channels, self.patch_dim)
+        video.to_empty(device=image_proj.weight.device).to(dtype=image_proj.weight.dtype)
+        with torch.no_grad():
+            video.proj.weight.copy_(video_patch_weight_from_image(image_proj.weight, temporal))
+        return video
+
+    def _fill_missing_video_patch_embed(self, state_dict, prefix, *args) -> None:
+        """``load_state_dict`` pre-hook: apply the lazy-init rules to a state dict without ``video_patch_embed``.
+
+        A Megatron checkpoint saved with T = 1 has no video weight. On a finetune load, Bridge's dist-ckpt filter
+        (``_drop_missing_video_patch_embed_keys``) drops the key from the request, and this hook derives the weight
+        from the loaded ``patch_embed`` weight. That runs in ``load_state_dict``, before
+        ``optimizer.reload_model_params()`` copies the model weights into the main params (the filter rejects
+        ``load_main_params_from_ckpt``, which reads them from the checkpoint dict instead). A strictness that drops missing keys, or Bridge's non-strict retry
+        after a failed strict load, would otherwise keep the construction-time value, which comes from the random
+        image weight. So this hook raises, and does not return, when the video key is missing and either
+        ``temporal_ckpt_compat`` is off or the image weight is missing too. Only a state dict without any of this
+        encoder's construction-time weights (an adapter-only partial load) is left to the caller's strictness.
+        """
+        del args
+        video_key = f"{prefix}video_patch_embed.proj.weight"
+        image_key = f"{prefix}patch_embed.proj.weight"
+        if video_key in state_dict:
+            return
+        if image_key not in state_dict:
+            present = [f"{prefix}{name}" for name in self._base_parameter_names if f"{prefix}{name}" in state_dict]
+            if not present:
+                return
+            raise RuntimeError(
+                f"The state dict has encoder weights (for example {present[0]}) but neither {video_key} nor "
+                f"{image_key}, so video_temporal_patch_size={self.video_temporal_patch_size} has no video patch "
+                "embedder to load or derive."
+            )
+        if not self.temporal_ckpt_compat:
+            raise RuntimeError(
+                f"The state dict has {image_key} but no {video_key}, which video_temporal_patch_size="
+                f"{self.video_temporal_patch_size} needs: it was saved without temporal compression. To derive it "
+                "from the image patch embedding, enable the lazy init (temporal_ckpt_compat)."
+            )
+        logger.warning(
+            "The state dict has no %s; deriving it from %s for video_temporal_patch_size=%d (temporal_ckpt_compat).",
+            video_key,
+            image_key,
+            self.video_temporal_patch_size,
+        )
+        state_dict[video_key] = video_patch_weight_from_image(state_dict[image_key], self.video_temporal_patch_size)
 
     def forward(
         self,
@@ -169,17 +288,191 @@ class Nemotron4MIMOVisionEncoder(_WithoutTEExtraState, ViTModel):
         packed_seq_params: PackedSeqParams,
         num_frames: torch.Tensor | None = None,
         expected_output_counts: torch.Tensor | None = None,
+        media_is_video: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Encode the MIMO packed-image payload, one ``imgs_sizes`` row per image.
+        """Encode the MIMO packed-media payload: per-frame patches ``x`` and one ``imgs_sizes`` row per frame.
 
-        Images have one frame, so ``num_frames`` is not used. ``expected_output_counts`` is part
-        of the payload and is not used here.
+        ``num_frames`` has one entry per media occurrence in payload order (1 for an image). With T = 1, or
+        without ``num_frames``, every frame is encoded as an image and ``num_frames``, ``expected_output_counts``
+        and ``media_is_video`` are not used. With T > 1, each video is encoded as tubelets, so it gives
+        ``ceil(num_frames / T)`` merged patch grids. The output rows are then checked against
+        ``expected_output_counts`` when the counts are on the host.
+
+        ``media_is_video`` (optional, one bool per occurrence) marks the videos. Without it, an occurrence with
+        more than one frame is a video and a one-frame occurrence is an image. With it, a one-frame video is
+        padded to a T-frame tubelet ``[f, f]`` and goes through ``video_patch_embed``, as the HF and vLLM models
+        do. The training data never sends a video with fewer than T frames.
         """
-        del num_frames, expected_output_counts
+        # The ViT reads the patch grid on the host; MIMO payloads carry it on the GPU.
+        imgs_sizes = imgs_sizes.cpu()
+        if self.video_temporal_patch_size > 1 and num_frames is None and media_is_video is not None:
+            raise ValueError("media_is_video needs num_frames: it has one entry per media occurrence.")
+        if self.video_temporal_patch_size == 1 or num_frames is None:
+            if self.video_temporal_patch_size > 1 and not self.warned_frames_as_images:
+                self.warned_frames_as_images = True
+                logger.warning(
+                    "The Nemotron4 vision encoder has video_temporal_patch_size=%d but the payload has no "
+                    "num_frames, so every frame is encoded as an image with patch_embed and video_patch_embed is "
+                    "not used. Callers that send video frames must pass num_frames (logged once).",
+                    self.video_temporal_patch_size,
+                )
+            del num_frames, expected_output_counts, media_is_video
+            return self._forward_frames(x, imgs_sizes, packed_seq_params)
+
+        frames_per_media = [int(count) for count in num_frames.reshape(-1).tolist()]
+        if any(count < 1 for count in frames_per_media) or sum(frames_per_media) != imgs_sizes.shape[0]:
+            raise ValueError(
+                f"num_frames must be positive and sum to the {imgs_sizes.shape[0]} imgs_sizes rows, "
+                f"got {frames_per_media}."
+            )
+        videos = self._video_flags(frames_per_media, media_is_video)
+        if not any(videos):
+            output = self._forward_frames(x, imgs_sizes, packed_seq_params)
+        else:
+            embedded, tubelet_sizes = self._embed_media(x, imgs_sizes, frames_per_media, videos)
+            # Attention, RoPE and the merger work per image or tubelet, so the THD boundaries follow the tubelets.
+            packed_seq_params = _build_vision_packed_seq_params(tubelet_sizes, self.patch_dim, x.device)
+            if self.recompute_budget_gib is not None and self.training and torch.is_grad_enabled():
+                self._fit_recompute_to_budget(embedded.shape[1])
+            output = self._forward_embedded(embedded, tubelet_sizes, packed_seq_params)
+        self._check_output_rows(output, expected_output_counts)
+        return output
+
+    def _forward_frames(
+        self, x: torch.Tensor, imgs_sizes: torch.Tensor, packed_seq_params: PackedSeqParams
+    ) -> torch.Tensor:
+        """Encode every frame as an image (the plain ViT forward)."""
         if self.recompute_budget_gib is not None and self.training and torch.is_grad_enabled():
             self._fit_recompute_to_budget(x.shape[1])
-        # The ViT reads the patch grid on the host; MIMO payloads carry it on the GPU.
-        return super().forward(x, imgs_sizes=imgs_sizes.cpu(), packed_seq_params=packed_seq_params)
+        return super().forward(x, imgs_sizes=imgs_sizes, packed_seq_params=packed_seq_params)
+
+    @staticmethod
+    def _video_flags(frames_per_media: list[int], media_is_video: torch.Tensor | None) -> list[bool]:
+        """Return one flag per media occurrence: True for a video, False for an image.
+
+        Without ``media_is_video``, an occurrence with more than one frame is a video. An image always has one
+        frame.
+        """
+        if media_is_video is None:
+            return [count > 1 for count in frames_per_media]
+        videos = [bool(flag) for flag in media_is_video.reshape(-1).tolist()]
+        if len(videos) != len(frames_per_media):
+            raise ValueError(
+                f"media_is_video must have one entry per media occurrence ({len(frames_per_media)}), "
+                f"got {len(videos)}."
+            )
+        images_with_frames = [media for media, count in enumerate(frames_per_media) if count > 1 and not videos[media]]
+        if images_with_frames:
+            raise ValueError(
+                f"Media occurrences {images_with_frames} have more than one frame but media_is_video marks them as "
+                "images; an image has one frame."
+            )
+        return videos
+
+    def _embed_media(
+        self,
+        x: torch.Tensor,
+        imgs_sizes: torch.Tensor,
+        frames_per_media: list[int],
+        videos: list[bool] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Embed images with ``patch_embed`` and video tubelets with ``video_patch_embed``, in payload order.
+
+        A tubelet concatenates the features of T consecutive frames in time order (frame-major), which matches
+        the ``video_patch_embed`` input channels. A video whose frame count is not a multiple of T repeats its
+        last frame up to the next multiple. This includes a video with fewer than T frames, so a one-frame video
+        is the tubelet ``[f, f]`` at T = 2. The training data path never sends such a video, so each pad logs a
+        warning. ``videos`` has one flag per occurrence (see ``_video_flags``); without it, an occurrence with
+        more than one frame is a video.
+
+        Returns:
+            The embedded rows ``[1, N, hidden]`` and one ``imgs_sizes`` row per image or tubelet.
+        """
+        temporal = self.video_temporal_patch_size
+        if videos is None:
+            videos = self._video_flags(frames_per_media, None)
+        sizes = [tuple(size) for size in imgs_sizes.tolist()]
+        _, frame_lengths = dynamic_patch_grid_lists(imgs_sizes, self.patch_dim)
+        frames = torch.split(x, frame_lengths, dim=1)
+        image_inputs, tubelet_inputs, is_tubelet, first_frames = [], [], [], []
+        start = 0
+        for media, count in enumerate(frames_per_media):
+            indices = list(range(start, start + count))
+            start += count
+            if not videos[media]:
+                image_inputs.append(frames[indices[0]])
+                is_tubelet.append(False)
+                first_frames.append(indices[0])
+                continue
+            if len({sizes[index] for index in indices}) != 1:
+                raise ValueError(
+                    f"All frames of video occurrence {media} must have one size, got {sizes[start - count : start]}."
+                )
+            if count % temporal:
+                indices += [indices[-1]] * (temporal - count % temporal)
+                self.padded_video_count += 1
+                logger.warning(
+                    "Video occurrence %d has %d frames, not a multiple of video_temporal_patch_size=%d; repeated "
+                    "its last frame (%d padded videos so far).",
+                    media,
+                    count,
+                    temporal,
+                    self.padded_video_count,
+                )
+            for first in range(0, len(indices), temporal):
+                group = indices[first : first + temporal]
+                tubelet_inputs.append(torch.cat([frames[index] for index in group], dim=-1))
+                is_tubelet.append(True)
+                first_frames.append(group[0])
+        images = self._embed_chunks(self.patch_embed, image_inputs)
+        tubelets = self._embed_chunks(self.video_patch_embed, tubelet_inputs)
+        embedded = torch.cat([next(tubelets if tubelet else images) for tubelet in is_tubelet], dim=1)
+        return embedded, imgs_sizes[first_frames]
+
+    @staticmethod
+    def _embed_chunks(embedding: PatchEmbedding, chunks: list[torch.Tensor]):
+        """Embed same-width chunks with one projection and yield them back in order."""
+        if not chunks:
+            return iter(())
+        lengths = [chunk.shape[1] for chunk in chunks]
+        return iter(torch.split(embedding.forward_patches(torch.cat(chunks, dim=1)), lengths, dim=1))
+
+    def _forward_embedded(
+        self, x: torch.Tensor, imgs_sizes: torch.Tensor, packed_seq_params: PackedSeqParams
+    ) -> torch.Tensor:
+        """Run the part of ``ViTModel.forward`` after the patch embedding, for packed dynamic-resolution input.
+
+        This mirrors Megatron-LM ``ViTModel.forward`` for the layout NM4 uses: no class token, 2D RoPE and the
+        optional patch merger, each computed per ``imgs_sizes`` row.
+        """
+        if self.add_class_token or self.pos_emb_type not in ("rope2d", "none"):
+            raise NotImplementedError("Nemotron4 tubelet encoding supports only 2D RoPE and no class token.")
+        patch_hw, seq_lens = dynamic_patch_grid_lists(imgs_sizes, self.patch_dim)
+        if self.ln_pre is not None:
+            x = self.ln_pre(x)
+        rotary_pos_emb = None
+        if self.pos_emb_type == "rope2d":
+            rotary_pos_emb = torch.cat([self.rope(h, w, x.device) for h, w in patch_hw], dim=0)
+        x = run_vision_transformer(
+            self.decoder, x, attention_mask=None, rotary_pos_emb=rotary_pos_emb, packed_seq_params=packed_seq_params
+        )
+        if self.merger is not None:
+            chunks = torch.split(x, seq_lens, dim=1)
+            x = torch.cat([self.merger(chunk, int(h), int(w)) for chunk, (h, w) in zip(chunks, patch_hw)], dim=1)
+        return x
+
+    @staticmethod
+    def _check_output_rows(output: torch.Tensor, expected_output_counts: torch.Tensor | None) -> None:
+        """Require the output rows to equal the payload's media output counts (host counts only, no sync)."""
+        if expected_output_counts is None or expected_output_counts.device.type != "cpu":
+            return
+        expected = int(expected_output_counts.sum())
+        if output.shape[1] != expected:
+            raise RuntimeError(
+                f"The Nemotron4 vision encoder produced {output.shape[1]} rows, but the payload's media output "
+                f"counts expect {expected}. With video_temporal_patch_size > 1 the data path must count one "
+                "merged patch grid per tubelet."
+            )
 
     def recompute_plan(self, patches: int) -> tuple[int, int]:
         """Return ``(n_full, n_mlp)`` whose estimated activations of ``patches`` fit the budget.
@@ -300,7 +593,11 @@ class Nemotron4VLModel(MegatronModule):
         pg_collection: ProcessGroupCollection | None = None,
         vision_dp_over_cp: bool = True,
         vp_stage: Optional[int] = None,
+        video_temporal_patch_size: int = 1,
+        separate_video_embedder: bool = True,
+        temporal_ckpt_compat: bool = False,
     ) -> None:
+        check_video_temporal_compression(video_temporal_patch_size, separate_video_embedder)
         super().__init__(config=language_transformer_config)
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -319,6 +616,7 @@ class Nemotron4VLModel(MegatronModule):
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.encoder_hidden_state = None
         self.pg_collection = pg_collection
+        self.video_temporal_patch_size = video_temporal_patch_size
 
         self.language_model = None
         if add_decoder:
@@ -360,7 +658,7 @@ class Nemotron4VLModel(MegatronModule):
                 )
                 vision_pg.tp_cp = vision_pg.tp
                 vision_pg.hcp = None
-            self.vision_model = ViTModel(
+            vision_kwargs = dict(
                 transformer_config=vision_transformer_config,
                 transformer_layer_spec=vision_transformer_layer_spec,
                 patch_dim=patch_dim,
@@ -375,6 +673,18 @@ class Nemotron4VLModel(MegatronModule):
                 pg_collection=vision_pg,
                 vp_stage=vp_stage,
             )
+            if video_temporal_patch_size == 1:
+                self.vision_model = ViTModel(**vision_kwargs)
+            else:
+                # Checkpoint conversion only: the MIMO encoder owns ``video_patch_embed`` under the same name, so
+                # ``vision_model.video_patch_embed.proj.weight`` matches the Nemotron4Bridge mapping. ``forward``
+                # rejects videos (see ``_encode_images``).
+                self.vision_model = Nemotron4MIMOVisionEncoder(
+                    **vision_kwargs,
+                    video_temporal_patch_size=video_temporal_patch_size,
+                    separate_video_embedder=separate_video_embedder,
+                    temporal_ckpt_compat=temporal_ckpt_compat,
+                )
             # The merger keeps the ViT width, so the projector input is the ViT
             # hidden size rather than a pixel-shuffled multiple of it.
             self.vision_projection = MultimodalProjector(
@@ -420,10 +730,25 @@ class Nemotron4VLModel(MegatronModule):
         if self.language_model is not None:
             self.language_model.set_input_tensor(input_tensor[0])
 
-    def _encode_images(self, images, imgs_sizes, vision_packed_seq_params) -> torch.Tensor:
-        """Return one projected row per image token."""
+    def _encode_images(self, images, imgs_sizes, vision_packed_seq_params, num_frames=None) -> torch.Tensor:
+        """Return one projected row per image token.
+
+        With ``video_temporal_patch_size`` T > 1 this model encodes images only: ``num_frames`` must be given and
+        be 1 for every media occurrence. Video tubelets need the MIMO encoder payload, which this model does not
+        build. ``num_frames`` is not used with T = 1.
+        """
         if self.vision_model is None or self.vision_projection is None:
             raise RuntimeError("Image data was provided on a stage without the vision encoder")
+        temporal = getattr(self, "video_temporal_patch_size", 1)
+        if temporal > 1:
+            frames = None if num_frames is None else [int(count) for count in torch.as_tensor(num_frames).reshape(-1)]
+            if frames is None or any(count != 1 for count in frames):
+                raise NotImplementedError(
+                    f"The non-MIMO Nemotron4VLModel with video_temporal_patch_size={temporal} is for checkpoint "
+                    "conversion and image-only forwards: it does not group video frames into tubelets. Pass "
+                    "num_frames with 1 per image, or use the MIMO model (Nemotron4MIMOVisionEncoder) for videos. "
+                    f"Got num_frames={frames}."
+                )
 
         parameter = next(self.vision_model.parameters())
         if imgs_sizes is not None:
@@ -465,10 +790,15 @@ class Nemotron4VLModel(MegatronModule):
         # The Pixtral ViT adds no class token and uses the patch merger rather
         # than pixel shuffle, so the encoder output already has exactly one row
         # per placeholder and needs no per-image regrouping.
+        vision_kwargs = {}
+        if temporal > 1:
+            # Images only (checked above): one frame per local image, so the encoder uses patch_embed.
+            vision_kwargs["num_frames"] = torch.ones(imgs_sizes.shape[0], dtype=torch.int32)
         encoded = self.vision_model(
             images.to(dtype=parameter.dtype),
             imgs_sizes=imgs_sizes,
             packed_seq_params=vision_packed_seq_params,
+            **vision_kwargs,
         )
         features = encoded.squeeze(0).unsqueeze(1)
         projected = self.vision_projection(features).squeeze(1)
@@ -539,6 +869,8 @@ class Nemotron4VLModel(MegatronModule):
             logits, token losses, and the returned mask use per-sequence zigzag
             ordering; decoder inputs retain the configured linear CP layout.
         """
+        # Frames per media occurrence; only a T > 1 model reads it (``_encode_images``).
+        num_frames = kwargs.pop("num_frames", None)
         del kwargs
         if images is None:
             images = pixel_values
@@ -578,7 +910,7 @@ class Nemotron4VLModel(MegatronModule):
             text_ids = input_ids.masked_fill(image_anchor_mask, 0)
             combined_embeddings = self.language_model.embedding(input_ids=text_ids, position_ids=position_ids)
             if images is not None and images.numel() > 0:
-                features = self._encode_images(images, imgs_sizes, vision_packed_seq_params)
+                features = self._encode_images(images, imgs_sizes, vision_packed_seq_params, num_frames=num_frames)
             else:
                 features = combined_embeddings.new_empty((0, combined_embeddings.shape[-1]))
             combined_embeddings = self._merge_projected_media(

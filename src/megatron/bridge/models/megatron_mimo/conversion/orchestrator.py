@@ -34,9 +34,11 @@ from transformers.configuration_utils import PretrainedConfig
 from megatron.bridge.models.conversion.auto_bridge import (
     MTP_CONFIG_FIELDS,
     AutoBridge,
+    _assert_required_hf_keys_in_template,
     _model_omits_mtp,
     _mtp_source_key_prefixes,
 )
+from megatron.bridge.models.conversion.auto_bridge import _required_hf_export_keys as _bridge_required_hf_export_keys
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import HFWeightTuple
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
@@ -944,6 +946,12 @@ def save_hf_pretrained_mimo(
         )
 
     standard_provider = bridge._require_provider().standard_provider
+    state_source = bridge.hf_pretrained.state.source
+    # Keys the source bridge requires in this export (for example a T > 1 video embedder). They must be in the
+    # template index and must be yielded, also with strict=False, which otherwise skips a key the index lacks.
+    required_keys = _required_hf_export_keys(bridge, standard_provider)
+    if required_keys:
+        _assert_required_hf_keys_in_template(state_source, required_keys, _template_name(bridge))
     mtp_disabled = _model_omits_mtp(standard_provider)
     output_path = Path(path)
     if dist.is_initialized():
@@ -955,19 +963,22 @@ def save_hf_pretrained_mimo(
     if dist.is_initialized():
         dist.barrier()
 
-    state_source = bridge.hf_pretrained.state.source
     assert isinstance(state_source, SafeTensorsStateSource), "checked above"
     ignored_source_key_prefixes = (
         _mtp_source_key_prefixes(state_source, bridge.hf_pretrained.config, standard_provider) if mtp_disabled else ()
     ) or None
+    yielded_keys: set[str] = set()
     state_source.save_generator(
-        _stream_mimo_weights_to_rank0(
-            source_bridge=bridge._model_bridge,
-            hf_pretrained=bridge.hf_pretrained,
-            mimo_model=mimo_model,
-            routes=routes,
-            pg_collections=pg_collections,
-            show_progress=show_progress,
+        _record_yielded_keys(
+            _stream_mimo_weights_to_rank0(
+                source_bridge=bridge._model_bridge,
+                hf_pretrained=bridge.hf_pretrained,
+                mimo_model=mimo_model,
+                routes=routes,
+                pg_collections=pg_collections,
+                show_progress=show_progress,
+            ),
+            yielded_keys,
         ),
         output_path,
         strict=strict,
@@ -978,7 +989,38 @@ def save_hf_pretrained_mimo(
         dist.barrier()
 
     if (not dist.is_initialized()) or dist.get_rank() == 0:
+        # Rank 0 receives every tensor. A required key that is in the index and was yielded has been written.
+        not_written = [key for key in required_keys if key not in yielded_keys]
+        if not_written:
+            raise RuntimeError(
+                f"save_hf_pretrained_mimo did not export {not_written}, which the model requires; the checkpoint at "
+                f"{output_path} is incomplete."
+            )
         logger.info("save_hf_pretrained_mimo: wrote HF checkpoint to %s", output_path)
+
+
+def _required_hf_export_keys(bridge: AutoBridge, standard_provider: object) -> tuple[str, ...]:
+    """Return the HF keys that the source bridge requires in an export of ``standard_provider``.
+
+    See ``auto_bridge._required_hf_export_keys``. The MIMO export writes the template config unchanged, so the hook
+    checks that config.
+    """
+    return _bridge_required_hf_export_keys(bridge._model_bridge, standard_provider, bridge.hf_pretrained.config)
+
+
+def _record_yielded_keys(
+    weights: Iterator[tuple[str, torch.Tensor]], yielded_keys: set[str]
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Pass ``(name, tensor)`` pairs through and record each name in ``yielded_keys``."""
+    for name, tensor in weights:
+        yielded_keys.add(name)
+        yield name, tensor
+
+
+def _template_name(bridge: AutoBridge) -> str:
+    """Return a printable name of the bridge's HF template."""
+    path = getattr(bridge.hf_pretrained, "model_name_or_path", None)
+    return repr(str(path)) if path is not None else "(unknown path)"
 
 
 def _copy_hf_artifacts(
