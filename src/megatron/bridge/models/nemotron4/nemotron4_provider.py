@@ -67,6 +67,7 @@ from megatron.bridge.models.nemotron4.modeling_nemotron4_vl import (
     Nemotron4MIMOVisionEncoder,
     Nemotron4VisionMLP,
     Nemotron4VLModel,
+    check_video_temporal_compression,
 )
 from megatron.bridge.training.mlm_compat.arguments import _transformer_config_from_args
 
@@ -402,6 +403,15 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
     img_h: int = 1540
     img_w: int = 1540
 
+    # Video temporal compression: T consecutive frames of a video form one tubelet, which a separate
+    # ``video_patch_embed`` (Conv2d over 3 * T channels) embeds. T = 1 builds no video embedder.
+    video_temporal_patch_size: int = 1
+    separate_video_embedder: bool = True
+    """Only True is supported: images keep ``patch_embed`` and video tubelets use ``video_patch_embed``."""
+    temporal_ckpt_compat: bool = False
+    """Lazy init: a checkpoint without temporal compression may lack the ``video_patch_embed`` weight, which is
+    then derived from ``patch_embed`` (``--allow-checkpoint-without-temporal-compression``)."""
+
     # Two-layer projector: vision_hidden -> projector_ffn -> language hidden.
     # ``None`` means "the language hidden size", which is what Nemotron4 uses.
     vision_projection_ffn_hidden_size: int | None = None
@@ -479,6 +489,7 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
 
     def build_mimo_modality_submodules_spec(self) -> dict[str, ModuleSpec]:
         """Build a Pixtral encoder and separate projector on the image component."""
+        check_video_temporal_compression(self.video_temporal_patch_size, self.separate_video_embedder)
         vision_config, projection_config = self._vision_configs(
             self._copy_config_without_runtime_process_groups(deep=True)
         )
@@ -503,6 +514,9 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
                                 "use_merger": self.spatial_merge_size > 1,
                                 "spatial_merge_size": self.spatial_merge_size,
                                 "recompute_budget_gib": self.vision_recompute_budget_gib,
+                                "video_temporal_patch_size": self.video_temporal_patch_size,
+                                "separate_video_embedder": self.separate_video_embedder,
+                                "temporal_ckpt_compat": self.temporal_ckpt_compat,
                             },
                         )
                     },
@@ -826,10 +840,25 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
             raise TypeError(f"Unexpected ViT MLP spec type: {type(vision_mlp_spec)!r}")
         return vision_layer_spec
 
+    def _non_mimo_video_kwargs(self) -> dict[str, Any]:
+        """Video tubelet arguments of ``Nemotron4VLModel``; none with T = 1, so the T = 1 build is unchanged."""
+        if self.video_temporal_patch_size == 1:
+            return {}
+        return {
+            "video_temporal_patch_size": self.video_temporal_patch_size,
+            "separate_video_embedder": self.separate_video_embedder,
+            "temporal_ckpt_compat": self.temporal_ckpt_compat,
+        }
+
     def provide(self, pre_process=None, post_process=None, vp_stage=None) -> Nemotron4VLModel:
-        """Build the Nemotron4 VLM for the current provider parallel sizes."""
+        """Build the Nemotron4 VLM for the current provider parallel sizes.
+
+        With ``video_temporal_patch_size`` T > 1 the model builds ``vision_model.video_patch_embed`` so that a T > 1
+        checkpoint converts (HF export and import). Its forward accepts images only; videos need the MIMO model.
+        """
         if self.vision_recompute_budget_gib is not None:
             raise ValueError("vision_recompute_budget_gib is supported only by the MIMO vision encoder.")
+        check_video_temporal_compression(self.video_temporal_patch_size, self.separate_video_embedder)
         require_nemotron4_mcore()
         language_cfg = self._copy_config_without_runtime_process_groups(deep=True)
         vision_cfg, projection_cfg = self._vision_configs(language_cfg)
@@ -863,6 +892,7 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
             pg_collection=pg_collection,
             vision_dp_over_cp=self.vision_dp_over_cp,
             vp_stage=vp_stage,
+            **self._non_mimo_video_kwargs(),
         )
         if self.freeze_language_model or self.freeze_vision_model or self.freeze_vision_projection:
             model.freeze(

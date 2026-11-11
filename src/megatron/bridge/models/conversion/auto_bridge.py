@@ -251,6 +251,61 @@ def _model_omits_mtp(model_config: Any) -> bool:
     return not value
 
 
+def _required_hf_export_keys(model_bridge: Any, provider: Any, hf_config: Any) -> tuple[str, ...]:
+    """Return the HF keys that ``model_bridge`` requires in an export of ``provider`` with ``hf_config``.
+
+    A model bridge class opts in with a ``required_hf_export_keys(provider, hf_config)`` classmethod, which may also
+    raise when ``hf_config`` (the config that the export writes) does not match the model. The method is looked up on
+    the class, so bridges without it (and test doubles) require nothing. Both exports call it: the standard
+    ``AutoBridge.save_hf_pretrained`` and the MIMO ``save_hf_pretrained_mimo``.
+    """
+    hook = _required_hf_export_keys_hook(model_bridge)
+    return () if hook is None else tuple(hook(provider, hf_config))
+
+
+def _required_hf_export_keys_hook(model_bridge: Any) -> Optional[Callable[[Any, Any], Iterable[str]]]:
+    """Return the ``required_hf_export_keys`` classmethod of ``model_bridge``'s class, or None."""
+    if model_bridge is None:
+        return None
+    return getattr(type(model_bridge), "required_hf_export_keys", None)
+
+
+def _assert_required_hf_keys_in_template(source: Any, required_keys: Iterable[str], template: Any) -> None:
+    """Raise before an export writes anything when the template index lacks a required key.
+
+    A save takes its expected keys from the template index; a non-strict save skips a yielded key that the index
+    lacks, so without this check a required tensor would be dropped silently.
+    """
+    template_keys = set(source.get_all_keys())
+    missing = [key for key in required_keys if key not in template_keys]
+    if missing:
+        raise ValueError(
+            f"The HF template {template} lacks {missing} in its weight index, so the export would not write them. "
+            "Use a template whose model.safetensors.index.json lists them."
+        )
+
+
+def _assert_required_hf_keys_written(path: Path, required_keys: Iterable[str]) -> None:
+    """Raise when a required key is not in the safetensors headers (and the index, if any) written under ``path``."""
+    from safetensors import safe_open
+
+    written: set[str] = set()
+    for shard in sorted(path.glob("*.safetensors")):
+        with safe_open(str(shard), framework="pt") as handle:
+            written.update(handle.keys())
+    index_file = path / "model.safetensors.index.json"
+    if index_file.is_file():
+        import json
+
+        written &= set(json.loads(index_file.read_text()).get("weight_map", {}))
+    not_written = [key for key in required_keys if key not in written]
+    if not_written:
+        raise RuntimeError(
+            f"The HF export did not write {not_written}, which the model requires; the checkpoint at {path} is "
+            "incomplete."
+        )
+
+
 # Preformatted display string for error/help messages
 SUPPORTED_HF_ARCHITECTURES_DISPLAY = " or ".join(f"'{s}'" for s in SUPPORTED_HF_ARCHITECTURES)
 
@@ -1226,6 +1281,20 @@ class AutoBridge(Generic[MegatronModelT]):
             raise ValueError("save_hf_pretrained requires a pretrained HuggingFace model or config.")
         is_config_only = isinstance(self.hf_pretrained, PretrainedConfig)
 
+        # Keys that the model bridge requires in this export (for example the video embedder of a Nemotron4 T > 1
+        # model). The hook also checks the HF config that this export writes, after any reference-config merge. A
+        # non-strict save skips a key that the template index lacks, so check the index now and the files after.
+        required_keys: tuple[str, ...] = ()
+        if _required_hf_export_keys_hook(model_bridge) is not None:
+            model_config = getattr(self._get_model_instance(model), "config", None)
+            hf_config = getattr(self.hf_pretrained, "config", self.hf_pretrained)
+            required_keys = _required_hf_export_keys(model_bridge, model_config, hf_config)
+            state_source = getattr(getattr(self.hf_pretrained, "state", None), "source", None)
+            if required_keys and isinstance(state_source, SafeTensorsStateSource):
+                template = getattr(self.hf_pretrained, "model_name_or_path", None)
+                template = template or getattr(self, "hf_model_id", None)
+                _assert_required_hf_keys_in_template(state_source, required_keys, repr(str(template)))
+
         def _save_artifacts():
             if is_config_only:
                 artifact_source_path = self.hf_model_id or source_path
@@ -1300,6 +1369,8 @@ class AutoBridge(Generic[MegatronModelT]):
             weight_postprocessor = getattr(type(model_bridge), "postprocess_hf_export_weights", None)
             if weight_postprocessor is not None:
                 weight_postprocessor(model_bridge, Path(path))
+            if required_keys:
+                _assert_required_hf_keys_written(Path(path), required_keys)
 
     def save_hf_weights(
         self,

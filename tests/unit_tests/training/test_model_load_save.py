@@ -102,6 +102,51 @@ class TestNormalizeMoeDispatcherSmConfig:
         }
 
 
+class TestClearSavedMegatronMimoDerivedSpecs:
+    """A training checkpoint saves MIMO derived specs that do not round-trip; loading drops them."""
+
+    MIMO_TARGET = "megatron.bridge.models.megatron_mimo.megatron_mimo_provider.MegatronMIMOProvider"
+
+    def _saved_specs(self):
+        return {
+            "language_model_spec": {"_target_": "megatron.core.transformer.spec_utils.ModuleSpec"},
+            "modality_submodules_spec": {"images": {"_target_": "megatron.core.transformer.spec_utils.ModuleSpec"}},
+            "special_token_ids": {"images": 18},
+        }
+
+    def test_clears_specs_of_a_mimo_provider_with_standard_provider(self):
+        model_dict = {"_target_": self.MIMO_TARGET, "standard_provider": {"_target_": "x.Provider"}}
+        model_dict.update(self._saved_specs())
+
+        model_load_save._clear_saved_megatron_mimo_derived_specs(model_dict)
+
+        assert model_dict["language_model_spec"] is None
+        assert model_dict["modality_submodules_spec"] == {}
+        assert model_dict["special_token_ids"] == {}
+        assert model_dict["standard_provider"] == {"_target_": "x.Provider"}
+
+    def test_keeps_user_specs_without_standard_provider(self):
+        model_dict = {"_target_": self.MIMO_TARGET, "standard_provider": None}
+        model_dict.update(self._saved_specs())
+
+        model_load_save._clear_saved_megatron_mimo_derived_specs(model_dict)
+
+        assert model_dict == {"_target_": self.MIMO_TARGET, "standard_provider": None, **self._saved_specs()}
+
+    def test_ignores_other_providers(self):
+        target = f"{GPTModelProvider.__module__}.{GPTModelProvider.__qualname__}"
+        model_dict = {"_target_": target, "standard_provider": {"_target_": "x.Provider"}}
+        model_dict.update(self._saved_specs())
+
+        model_load_save._clear_saved_megatron_mimo_derived_specs(model_dict)
+
+        assert model_dict == {
+            "_target_": target,
+            "standard_provider": {"_target_": "x.Provider"},
+            **self._saved_specs(),
+        }
+
+
 class TestTorchDtypeFromMcoreConfig:
     """Test torch_dtype_from_mcore_config function."""
 

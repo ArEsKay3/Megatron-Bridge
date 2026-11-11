@@ -77,7 +77,11 @@ from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.megatron_mimo.conversion import MIMOComponent, register_mimo_conversion_spec
 from megatron.bridge.models.megatron_mimo.megatron_mimo_config import MegatronMIMOParallelismConfig
 from megatron.bridge.models.megatron_mimo.megatron_mimo_provider import MegatronMIMOProvider
-from megatron.bridge.models.nemotron4.modeling_nemotron4_vl import Nemotron4VLModel
+from megatron.bridge.models.nemotron4.modeling_nemotron4_vl import (
+    Nemotron4VLModel,
+    check_video_temporal_compression,
+    video_patch_weight_from_image,
+)
 from megatron.bridge.models.nemotron4.nemotron4_provider import (
     NEMOTRON4_SSA_INDEXER_LOSS_COEFF,
     Nemotron4VLModelProvider,
@@ -100,6 +104,11 @@ _LAYER_TYPE_TO_PATTERN = {
 
 # Synthesized HF name prefix for Megatron-only state; never present in an HF checkpoint.
 _MEGATRON_ONLY_PREFIX = "megatron_only::"
+
+# Image and video patch embeddings. The video tensor sits at the top level of ``model.``: the HF and vLLM
+# Pixtral towers reject unknown names under ``vision_tower.``.
+_HF_IMAGE_PATCH_CONV = "model.vision_tower.patch_conv.weight"
+_HF_VIDEO_PATCH_CONV = "model.video_patch_conv.weight"
 
 # Shapes supported by MCore's CuTe SSA kernels.
 _SSA_TOPK_VALUES = (512, 1024, 2048)
@@ -129,6 +138,36 @@ def ssa_provider_kwargs(text_config: Any) -> dict[str, Any]:
         # Nemotron4 has no position embedding.
         "apply_rope_fusion": False,
     }
+
+
+def hf_video_temporal_patch_size(hf_config: Any) -> int:
+    """Tubelet size T of the top-level HF config field ``video_temporal_patch_size`` (1 when absent)."""
+    value = getattr(hf_config, "video_temporal_patch_size", None)
+    return 1 if value is None else int(value)
+
+
+def hf_separate_video_embedder(hf_config: Any) -> bool:
+    """Top-level HF config field ``separate_video_embedder`` (True when absent)."""
+    value = getattr(hf_config, "separate_video_embedder", None)
+    return True if value is None else bool(value)
+
+
+def assert_no_temporal_ckpt_compat(hf_config_dict: Mapping[str, Any]) -> None:
+    """Raise when ``temporal_ckpt_compat`` appears anywhere in an HF config dict.
+
+    ``temporal_ckpt_compat`` is a load-time option of the Megatron provider (lazy init of the video embedder). An
+    exported HF config must never carry it: a reader could take it as a property of the checkpoint.
+    """
+    stack = [("", hf_config_dict)]
+    while stack:
+        prefix, current = stack.pop()
+        for key, value in current.items():
+            if key == "temporal_ckpt_compat":
+                raise AssertionError(
+                    f"temporal_ckpt_compat must not reach an exported HF config (found {prefix}{key}={value!r})."
+                )
+            if isinstance(value, Mapping):
+                stack.append((f"{prefix}{key}.", value))
 
 
 def layer_types_to_hybrid_pattern(layer_types: list[str]) -> str:
@@ -240,6 +279,14 @@ class _SingleTPColumnMapping(ColumnParallelMapping):
         """Export the fused tensor at TP=1."""
         self._require_single_tp()
         return super().megatron_to_hf(megatron_weights, megatron_module)
+
+
+class _VideoPatchConvMapping(ReplicatedMapping):
+    """``video_patch_embed`` weight. Its HF tensor may be absent; the import then derives it (lazy init)."""
+
+    def __init__(self, megatron_param: str, hf_param: str):
+        super().__init__(megatron_param, hf_param)
+        self.allow_hf_name_mismatch = True
 
 
 _warned_dropped_megatron_state: set[str] = set()
@@ -368,6 +415,9 @@ class Nemotron4Bridge(MegatronModelBridge):
             img_h=vision.image_size,
             img_w=vision.image_size,
             vision_projection_ffn_hidden_size=None,
+            video_temporal_patch_size=hf_video_temporal_patch_size(hf_config),
+            separate_video_embedder=hf_separate_video_embedder(hf_config),
+            temporal_ckpt_compat=bool(getattr(self, "temporal_ckpt_compat", False)),
             moe_router_qb_bias_space=getattr(text, "moe_router_bias_space", "score"),
             moe_shortcut_disable_mtp=getattr(text, "moe_shortcut_disable_mtp", False),
             **sparse_attention,
@@ -387,15 +437,106 @@ class Nemotron4Bridge(MegatronModelBridge):
             gdp_g_clamp_value=getattr(provider, "gdp_g_clamp_value", None),
             moe_shortcut_disable_mtp=bool(getattr(provider, "moe_shortcut_disable_mtp", False)),
         )
+        temporal = int(getattr(provider, "video_temporal_patch_size", 1) or 1)
+        if temporal > 1:
+            # Top-level fields, as the HF and vLLM Nemotron4 configs read them. T = 1 emits nothing, so a T = 1
+            # export keeps its config. ``conform_config_to_reference`` keeps them only when the reference config
+            # declares them (a T = 2 template does); otherwise the registry has no video mapping and the export
+            # fails on the unmapped ``video_patch_embed`` weight.
+            separate = bool(getattr(provider, "separate_video_embedder", True))
+            check_video_temporal_compression(temporal, separate)
+            hf_cfg["video_temporal_patch_size"] = temporal
+            hf_cfg["separate_video_embedder"] = separate
+        assert_no_temporal_ckpt_compat(hf_cfg)
         return hf_cfg
+
+    @classmethod
+    def required_hf_export_keys(cls, provider: Any, hf_config: Any) -> tuple[str, ...]:
+        """HF tensors that an export of ``provider`` must write, even when the save is not strict.
+
+        A T > 1 model must export ``model.video_patch_conv.weight``. The HF config that the export writes must
+        declare the same T and must not carry ``temporal_ckpt_compat`` (any T). Both exports call this before they
+        write anything: ``AutoBridge.save_hf_pretrained`` (non-MIMO; ``hf_config`` is the final config, after
+        ``conform_config_to_reference`` filled keys from the template) and ``save_hf_pretrained_mimo``.
+
+        Raises:
+            ValueError: If the HF config declares another T than the provider.
+            AssertionError: If the HF config carries ``temporal_ckpt_compat``.
+        """
+        hf_config_dict = hf_config.to_dict() if hasattr(hf_config, "to_dict") else dict(vars(hf_config))
+        assert_no_temporal_ckpt_compat(hf_config_dict)
+        temporal = int(getattr(provider, "video_temporal_patch_size", 1) or 1)
+        hf_temporal = hf_video_temporal_patch_size(hf_config)
+        if hf_temporal != temporal:
+            raise ValueError(
+                f"The model has video_temporal_patch_size={temporal} but the HF config to export declares "
+                f"{hf_temporal}. Export with an HF template whose config.json declares video_temporal_patch_size="
+                f"{temporal} (and, for T > 1, lists {_HF_VIDEO_PATCH_CONV} in model.safetensors.index.json)."
+            )
+        return (_HF_VIDEO_PATCH_CONV,) if temporal > 1 else ()
 
     def maybe_modify_loaded_hf_weight(
         self, hf_param: str | dict[str, str], hf_state_dict: Mapping[str, torch.Tensor]
     ) -> torch.Tensor | dict[str, torch.Tensor] | None:
-        """Skip the lookup for Megatron-only state, which has no HF tensor."""
+        """Skip the lookup for Megatron-only state, which has no HF tensor; resolve the video patch conv."""
         if isinstance(hf_param, str) and hf_param.startswith(_MEGATRON_ONLY_PREFIX):
             return None
+        if hf_param == _HF_VIDEO_PATCH_CONV:
+            return self._load_video_patch_conv(hf_state_dict)
         return super().maybe_modify_loaded_hf_weight(hf_param, hf_state_dict)
+
+    def _load_video_patch_conv(self, hf_state_dict: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        """Load ``model.video_patch_conv.weight``, or derive it from the image patch conv (lazy init).
+
+        Every loader of this weight applies the same rules. A present tensor loads as is. A missing tensor is
+        derived (``cat([W_image / T] * T, dim=1)``) only when ``temporal_ckpt_compat`` is on and the source HF
+        config declared no temporal compression (``source_video_temporal_patch_size`` <= 1). Otherwise this
+        raises. nemo_rl sets both attributes on the import bridge before ``load_hf_weights``. When
+        ``source_video_temporal_patch_size`` is unset, the caller did not change the HF config, so its own T is
+        the source T.
+
+        Raises:
+            ValueError: If the tensor is missing and the lazy init does not apply.
+        """
+        if _HF_VIDEO_PATCH_CONV in hf_state_dict:
+            return hf_state_dict[_HF_VIDEO_PATCH_CONV]
+        temporal = hf_video_temporal_patch_size(self.hf_config)
+        source_temporal = getattr(self, "source_video_temporal_patch_size", None)
+        source_temporal = temporal if source_temporal is None else int(source_temporal)
+        if source_temporal > 1:
+            raise ValueError(
+                f"The HF checkpoint declares video_temporal_patch_size={source_temporal} but has no "
+                f"{_HF_VIDEO_PATCH_CONV}: its trained video embedder was lost, for example by an export against a "
+                "T=1 template. Re-export the checkpoint with that tensor; it is not re-derived from the image patch "
+                "conv."
+            )
+        if not getattr(self, "temporal_ckpt_compat", False):
+            raise ValueError(
+                f"The HF checkpoint has no {_HF_VIDEO_PATCH_CONV}, which video_temporal_patch_size={temporal} needs. "
+                f"To initialize it from {_HF_IMAGE_PATCH_CONV}, enable the lazy init (temporal_ckpt_compat; in "
+                "nemo_rl, policy.video_temporal_compression.init_missing_video_embedder=true)."
+            )
+        logger.warning(
+            "The HF checkpoint has no %s; deriving it from %s for video_temporal_patch_size=%d "
+            "(temporal_ckpt_compat).",
+            _HF_VIDEO_PATCH_CONV,
+            _HF_IMAGE_PATCH_CONV,
+            temporal,
+        )
+        return video_patch_weight_from_image(hf_state_dict[_HF_IMAGE_PATCH_CONV], temporal)
+
+    @staticmethod
+    def get_hf_import_param_names(
+        hf_param: str | dict[str, str],
+        available_hf_param_names: set[str] | None = None,
+    ) -> tuple[str, ...]:
+        """Declare the image patch conv as an input of the video patch conv, which the lazy init derives from it."""
+        names = MegatronModelBridge.get_hf_import_param_names(hf_param, available_hf_param_names)
+        if hf_param == _HF_VIDEO_PATCH_CONV and (
+            available_hf_param_names is None or _HF_IMAGE_PATCH_CONV in available_hf_param_names
+        ):
+            names = tuple(dict.fromkeys((*names, _HF_IMAGE_PATCH_CONV)))
+        return names
 
     def maybe_modify_converted_hf_weight(
         self,
@@ -586,8 +727,13 @@ class Nemotron4Bridge(MegatronModelBridge):
         HV = "model.vision_tower"
         HVL = f"{HV}.transformer.layers.*"
         HP = "model.multi_modal_projector"
+        video = []
+        if hf_video_temporal_patch_size(self.hf_config) > 1:
+            # Tubelet patch embedding: Conv2d over 3 * T frame-major channels, no bias.
+            video.append(_VideoPatchConvMapping(f"{V}.video_patch_embed.proj.weight", _HF_VIDEO_PATCH_CONV))
         mappings += [
             ReplicatedMapping(f"{V}.patch_embed.proj.weight", f"{HV}.patch_conv.weight"),
+            *video,
             ReplicatedMapping(f"{V}.ln_pre.weight", f"{HV}.ln_pre.weight"),
             AutoMapping(f"{VL}.self_attention.linear_qkv.layer_norm_weight", f"{HVL}.attention_norm.weight"),
             _PixtralQKVMapping(
@@ -639,6 +785,7 @@ def _validate_hf_config(hf_config) -> None:
         )
     if vision.num_attention_heads * vision.head_dim != vision.hidden_size:
         raise ValueError("Nemotron4 vision_config requires num_attention_heads * head_dim == hidden_size.")
+    check_video_temporal_compression(hf_video_temporal_patch_size(hf_config), hf_separate_video_embedder(hf_config))
     _validate_sparse_attention(text)
 
 

@@ -268,6 +268,30 @@ def _normalize_moe_dispatcher_sm_config(model_dict: dict[str, Any]) -> None:
             model_dict[legacy_key] = None
 
 
+def _clear_saved_megatron_mimo_derived_specs(model_dict: dict[str, Any]) -> None:
+    """Drop the MIMO spec fields that the provider rebuilds from ``standard_provider``.
+
+    The conversion save clears these fields before it writes YAML
+    (``mimo_model_io._clear_derived_spec_fields``), but a training checkpoint saves them
+    in full, and they do not round-trip: the language config carries grad hooks over
+    ``MegatronMIMOInfra`` and DDP modules, and MLP submodule partials lose their fields.
+    ``MegatronMIMOProvider.__post_init__`` rebuilds all three from ``standard_provider``.
+    """
+    target = model_dict.get("_target_")
+    if not isinstance(target, str) or model_dict.get("standard_provider") is None:
+        return
+
+    from megatron.bridge.models.megatron_mimo.megatron_mimo_provider import MegatronMIMOProvider
+    from megatron.bridge.utils.instantiate_utils import _resolve_target
+
+    provider_cls = _resolve_target(target, full_key="model._target_")
+    if not (isinstance(provider_cls, type) and issubclass(provider_cls, MegatronMIMOProvider)):
+        return
+    model_dict["language_model_spec"] = None
+    model_dict["modality_submodules_spec"] = {}
+    model_dict["special_token_ids"] = {}
+
+
 def load_model_config(
     checkpoint_path: str,
 ) -> tuple[TransformerConfig | ModelConfig, Optional[argparse.Namespace]]:
@@ -307,6 +331,7 @@ def load_model_config(
         if isinstance(model_dict.get("pipeline_model_parallel_layout"), dict):
             model_dict["pipeline_model_parallel_layout"] = None
         _normalize_moe_dispatcher_sm_config(model_dict)
+        _clear_saved_megatron_mimo_derived_specs(model_dict)
     else:
         try:
             mlm_args = _load_args_from_checkpoint(checkpoint_path)
