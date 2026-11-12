@@ -2394,7 +2394,8 @@ def _drop_missing_video_patch_embed_keys(
         raise RuntimeError(
             f"Checkpoint {checkpoint_name} has no {missing_keys}: it was saved without video temporal "
             "compression. To derive the video patch embedder from the image patch embedder, enable the lazy "
-            "init (temporal_ckpt_compat; in NeMo RL policy.video_temporal_compression.init_missing_video_embedder)."
+            "init (temporal_ckpt_compat; in NeMo RL policy.megatron_cfg.mimo.video_temporal_compression."
+            "init_missing_video_embedder)."
         )
     declared = sorted(t for t in _run_config_video_temporal_patch_sizes((run_config or {}).get("model")) if t > 1)
     if declared:

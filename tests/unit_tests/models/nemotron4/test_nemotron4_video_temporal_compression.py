@@ -546,6 +546,40 @@ def test_missing_video_tensor_raises_without_the_lazy_init(flag, source, match):
         _import_bridge(flag, source).maybe_modify_loaded_hf_weight(HF_VIDEO, StateDict(_state(with_video=False)))
 
 
+def test_import_options_are_declared_with_defaults():
+    bridge = Nemotron4Bridge()
+    assert bridge.temporal_ckpt_compat is False
+    assert bridge.source_video_temporal_patch_size is None
+    # The provider gets the declared flag.
+    provider = bridge.provider_bridge(SimpleNamespace(config=_hf_config(video_temporal_patch_size=2)))
+    assert provider.temporal_ckpt_compat is False
+
+
+def test_configure_video_patch_import_sets_both_options():
+    bridge = _bridge(video_temporal_patch_size=2)
+    bridge.configure_video_patch_import(temporal_ckpt_compat=True, source_video_temporal_patch_size=1)
+    assert (bridge.temporal_ckpt_compat, bridge.source_video_temporal_patch_size) == (True, 1)
+    # The lazy init then derives the missing tensor.
+    tensors = _state(with_video=False)
+    loaded = bridge.maybe_modify_loaded_hf_weight(HF_VIDEO, tensors)
+    assert torch.equal(loaded, torch.cat([tensors[HF_IMAGE] / 2] * 2, dim=1))
+    # Instances do not share the options.
+    assert Nemotron4Bridge().temporal_ckpt_compat is False
+
+
+@pytest.mark.parametrize("source", [0, -1, 1.0, True, "1", None])
+def test_configure_video_patch_import_rejects_a_bad_source_t(source):
+    with pytest.raises(ValueError, match="source_video_temporal_patch_size"):
+        Nemotron4Bridge().configure_video_patch_import(
+            temporal_ckpt_compat=True, source_video_temporal_patch_size=source
+        )
+
+
+def test_configure_video_patch_import_takes_only_the_declared_options():
+    with pytest.raises(TypeError):
+        Nemotron4Bridge().configure_video_patch_import(temporal_ckpt_compat=True, source_temporal_patch_size=1)
+
+
 def test_other_tensors_load_unchanged():
     tensors = _state(with_video=False)
     assert _import_bridge(True).maybe_modify_loaded_hf_weight(HF_IMAGE, tensors) is tensors[HF_IMAGE]

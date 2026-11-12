@@ -703,6 +703,34 @@ class TestMegatronMIMOBridge:
         assert bridge.hf_model_id == "hf-model"
         assert isinstance(bridge._model_bridge, _FakeSourceBridgeForMIMOBridge)
 
+    def test_source_bridge_is_the_model_bridge_the_import_uses(self):
+        bridge = _mimo_bridge()
+
+        source = bridge.source_bridge
+
+        assert source is bridge._model_bridge
+        assert bridge.source_bridge is source
+
+    def test_source_bridge_pins_a_resolved_model_bridge(self, monkeypatch):
+        _ensure_fake_mimo_conversion_spec_registered()
+        built = []
+
+        def _new_model_bridge(self):
+            built.append(_FakeSourceBridgeForMIMOBridge())
+            return built[-1]
+
+        # AutoBridge resolves a new per-model bridge on each access.
+        monkeypatch.setattr(orchestrator_module.AutoBridge, "_model_bridge", property(_new_model_bridge))
+        bridge = MegatronMIMOBridge(PretrainedConfig(), parallelism_config=_bridge_parallelism_config())
+
+        source = bridge.source_bridge
+        source.marker = "set before load_hf_weights"
+
+        assert bridge.source_bridge is source
+        assert bridge._model_bridge is source
+        assert bridge._model_bridge.marker == "set before load_hf_weights"
+        assert len(built) == 1
+
     def test_load_hf_weights_delegates_to_route_import(self, monkeypatch):
         calls = []
 
