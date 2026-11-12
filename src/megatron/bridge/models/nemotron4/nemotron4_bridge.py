@@ -55,7 +55,7 @@ With ``index_topk`` unset the model is dense and has no indexer.
 """
 
 import logging
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 import torch
 from torch import nn
@@ -336,6 +336,38 @@ class Nemotron4Bridge(MegatronModelBridge):
     # runs; copy its config verbatim instead so the exported directory loads as a VLM.
     ADDITIONAL_FILE_PATTERNS = ["processor_config.json", "preprocessor_config.json"]
 
+    # Options of the HF weight import; they never reach an exported HF config. Set them with
+    # ``configure_video_patch_import``. ``temporal_ckpt_compat``: derive a missing ``model.video_patch_conv``
+    # from the image patch conv (lazy init); it also reaches the provider. ``source_video_temporal_patch_size``:
+    # the T that the HF checkpoint's config declared before the caller set the model T on the in-memory config;
+    # None means the caller did not change the config, so the config's own T is the source T.
+    temporal_ckpt_compat: bool = False
+    source_video_temporal_patch_size: Optional[int] = None
+
+    def configure_video_patch_import(
+        self, *, temporal_ckpt_compat: bool, source_video_temporal_patch_size: int
+    ) -> None:
+        """Set the HF import options of the video patch conv (see :meth:`_load_video_patch_conv`).
+
+        Call this on the per-model bridge that the import uses (for MIMO, ``MegatronMIMOBridge.source_bridge``)
+        before ``load_hf_weights``. The MIMO route bridges are shallow copies of it and keep both values.
+
+        Args:
+            temporal_ckpt_compat: Derive a missing video patch conv from the image patch conv.
+            source_video_temporal_patch_size: T that the HF checkpoint's own config declares (1 when none).
+
+        Raises:
+            ValueError: If ``source_video_temporal_patch_size`` is not a positive integer.
+        """
+        if isinstance(source_video_temporal_patch_size, bool) or not isinstance(source_video_temporal_patch_size, int):
+            raise ValueError(
+                f"source_video_temporal_patch_size must be an int, got {source_video_temporal_patch_size!r}."
+            )
+        if source_video_temporal_patch_size < 1:
+            raise ValueError(f"source_video_temporal_patch_size must be >= 1, got {source_video_temporal_patch_size}.")
+        self.temporal_ckpt_compat = bool(temporal_ckpt_compat)
+        self.source_video_temporal_patch_size = source_video_temporal_patch_size
+
     def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> Nemotron4VLModelProvider:
         """Build a :class:`Nemotron4VLModelProvider` from the HF config.
 
@@ -417,7 +449,7 @@ class Nemotron4Bridge(MegatronModelBridge):
             vision_projection_ffn_hidden_size=None,
             video_temporal_patch_size=hf_video_temporal_patch_size(hf_config),
             separate_video_embedder=hf_separate_video_embedder(hf_config),
-            temporal_ckpt_compat=bool(getattr(self, "temporal_ckpt_compat", False)),
+            temporal_ckpt_compat=self.temporal_ckpt_compat,
             moe_router_qb_bias_space=getattr(text, "moe_router_bias_space", "score"),
             moe_shortcut_disable_mtp=getattr(text, "moe_shortcut_disable_mtp", False),
             **sparse_attention,
@@ -491,9 +523,9 @@ class Nemotron4Bridge(MegatronModelBridge):
         Every loader of this weight applies the same rules. A present tensor loads as is. A missing tensor is
         derived (``cat([W_image / T] * T, dim=1)``) only when ``temporal_ckpt_compat`` is on and the source HF
         config declared no temporal compression (``source_video_temporal_patch_size`` <= 1). Otherwise this
-        raises. nemo_rl sets both attributes on the import bridge before ``load_hf_weights``. When
-        ``source_video_temporal_patch_size`` is unset, the caller did not change the HF config, so its own T is
-        the source T.
+        raises. Callers set both options with :meth:`configure_video_patch_import` before ``load_hf_weights``.
+        When ``source_video_temporal_patch_size`` is unset, the caller did not change the HF config, so its own T
+        is the source T.
 
         Raises:
             ValueError: If the tensor is missing and the lazy init does not apply.
@@ -501,7 +533,7 @@ class Nemotron4Bridge(MegatronModelBridge):
         if _HF_VIDEO_PATCH_CONV in hf_state_dict:
             return hf_state_dict[_HF_VIDEO_PATCH_CONV]
         temporal = hf_video_temporal_patch_size(self.hf_config)
-        source_temporal = getattr(self, "source_video_temporal_patch_size", None)
+        source_temporal = self.source_video_temporal_patch_size
         source_temporal = temporal if source_temporal is None else int(source_temporal)
         if source_temporal > 1:
             raise ValueError(
@@ -510,11 +542,11 @@ class Nemotron4Bridge(MegatronModelBridge):
                 "T=1 template. Re-export the checkpoint with that tensor; it is not re-derived from the image patch "
                 "conv."
             )
-        if not getattr(self, "temporal_ckpt_compat", False):
+        if not self.temporal_ckpt_compat:
             raise ValueError(
                 f"The HF checkpoint has no {_HF_VIDEO_PATCH_CONV}, which video_temporal_patch_size={temporal} needs. "
                 f"To initialize it from {_HF_IMAGE_PATCH_CONV}, enable the lazy init (temporal_ckpt_compat; in "
-                "nemo_rl, policy.video_temporal_compression.init_missing_video_embedder=true)."
+                "nemo_rl, policy.megatron_cfg.mimo.video_temporal_compression.init_missing_video_embedder=true)."
             )
         logger.warning(
             "The HF checkpoint has no %s; deriving it from %s for video_temporal_patch_size=%d "

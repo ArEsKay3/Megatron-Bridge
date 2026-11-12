@@ -401,6 +401,17 @@ class MegatronMIMOBridge(AutoBridge):
         raise NotImplementedError("MegatronMIMOBridge does not support config-only checkpoint export yet.")
 
     @property
+    def source_bridge(self) -> "MegatronModelBridge":
+        """The per-model bridge that the imports and exports of this MIMO bridge use.
+
+        It is the same object on every access, so import options set on it (for example
+        ``Nemotron4Bridge.configure_video_patch_import``) reach ``load_hf_weights``.
+        """
+        if self._source_bridge_override is None:
+            self._source_bridge_override = super()._model_bridge
+        return self._model_bridge
+
+    @property
     def _model_bridge(self) -> "MegatronModelBridge":
         if self._source_bridge_override is not None:
             self._source_bridge_override.export_weight_dtype = self.export_weight_dtype
