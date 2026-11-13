@@ -199,6 +199,7 @@ def setup_megatron_mimo(
     from megatron.bridge.models.megatron_mimo import build_megatron_mimo_model
 
     megatron_mimo_provider = cfg.model
+    megatron_mimo_provider.gtp_remat_nccl_ub = cfg.dist.gtp_remat_nccl_ub
     model, megatron_mimo_infra = build_megatron_mimo_model(
         megatron_mimo_provider,
         ddp_config=cfg.ddp,

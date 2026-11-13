@@ -169,6 +169,9 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
     # Receive each encoder -> language fan-in on several ranks of a language replica (bitwise the same).
     bridge_spread_fan_in: bool = False
 
+    # Register the language module's dense GTP remat group with an NCCL symmetric-memory pool.
+    gtp_remat_nccl_ub: bool = False
+
     # Cached grids after build_model() - used by data loading
     _grids: Optional[Dict[str, "HyperCommGrid"]] = field(default=None, repr=False)
 
@@ -528,7 +531,11 @@ class MegatronMIMOProvider(ModelProviderMixin[MimoModel]):
         if llm_pg is not None:
             from megatron.bridge.training.gtp import configure_gtp_remat
 
-            configure_gtp_remat(language_spec.params.get("config"))
+            configure_gtp_remat(
+                language_spec.params.get("config"),
+                nccl_ub=self.gtp_remat_nccl_ub,
+                pg_collection=llm_pg,
+            )
 
         # Create MimoModel
         mimo_model_config = MimoModelConfig(

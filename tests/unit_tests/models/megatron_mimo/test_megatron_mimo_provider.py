@@ -1068,3 +1068,29 @@ def test_mimo_configures_gtp_before_allocating_weights(monkeypatch, gtp, egtp):
 
     monkeypatch.setattr(module, "MimoModel", construct)
     provider.provide(infra=infra)
+
+
+def test_mimo_forwards_gtp_remat_nccl_ub(monkeypatch):
+    from megatron.bridge.models.megatron_mimo import megatron_mimo_provider as module
+    from megatron.bridge.training import gtp
+
+    config = SimpleNamespace()
+    provider = MegatronMIMOProvider(
+        language_model_spec=ModuleSpec(module=Mock, params={"config": config}),
+        megatron_mimo_parallelism_config=MegatronMIMOParallelismConfig(
+            module_parallelisms={"language": ModuleParallelismConfig(data_parallel_size=1)}
+        ),
+        gtp_remat_nccl_ub=True,
+    )
+    groups = SimpleNamespace(tp=object(), cp=object(), pp=object())
+    infra = SimpleNamespace(pg_collections={"language": groups}, module_to_grid_map={})
+    monkeypatch.setattr(provider, "_inject_pg_collection_into_language_spec", lambda spec, *a, **k: spec)
+    monkeypatch.setattr(module, "is_pp_first_stage", lambda group: True)
+    monkeypatch.setattr(module, "is_pp_last_stage", lambda group: True)
+    monkeypatch.setattr(module, "MimoModel", MagicMock())
+    configure = Mock()
+    monkeypatch.setattr(gtp, "configure_gtp_remat", configure)
+
+    provider.provide(infra=infra)
+
+    configure.assert_called_once_with(config, nccl_ub=True, pg_collection=groups)
