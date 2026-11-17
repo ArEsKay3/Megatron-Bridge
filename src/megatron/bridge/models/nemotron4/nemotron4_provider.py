@@ -56,7 +56,7 @@ from megatron.core.pipeline_parallel.utils import is_pp_first_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
 from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.spec_utils import ModuleSpec, import_module
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig as MCoreTransformerConfig
 
 from megatron.bridge.models.hybrid.hybrid_provider import HybridModelProvider
@@ -116,18 +116,42 @@ def require_nemotron4_mcore() -> None:
         )
 
 
-def nemotron4_stack_spec() -> ModuleSpec:
+def nemotron4_stack_spec(config: Any = None) -> ModuleSpec:
     """Return the gated-delta-product hybrid stack spec Nemotron4 was trained with.
 
+    ``config`` selects the variant of that spec: ``transformer_impl='inference_optimized'``
+    uses its inference counterpart, and a configured ``wide_residual`` uses its wide-residual
+    counterpart on MCore builds that implement wide residuals in dedicated layer classes.
     A named function (not a lambda) so the provider stays serializable.
     """
+    return _resolve_nemotron4_spec_variant(
+        "megatron.core.models.hybrid.hybrid_layer_specs", "gated_delta_product_stack_spec", config
+    )
+
+
+def _resolve_nemotron4_spec_variant(module_path: str, spec_name: str, config: Any) -> ModuleSpec:
+    """Return ``module_path.spec_name`` adjusted to the inference and wide-residual variants ``config`` needs.
+
+    Raises:
+        RuntimeError: If the installed megatron.core does not define the required spec.
+    """
+    stem = spec_name.removeprefix("wide_residual_").replace("_inference_stack_spec", "_stack_spec")
+    if config is not None and getattr(config, "transformer_impl", None) == "inference_optimized":
+        stem = stem.removesuffix("_stack_spec") + "_inference_stack_spec"
     try:
-        from megatron.core.models.hybrid.hybrid_layer_specs import gated_delta_product_stack_spec
+        module = importlib.import_module(module_path)
     except ImportError as error:
-        raise RuntimeError(
-            "The installed megatron.core has no gated_delta_product_stack_spec, which Nemotron4 needs."
-        ) from error
-    return gated_delta_product_stack_spec
+        raise RuntimeError(f"The installed megatron.core has no {module_path}, which Nemotron4 needs.") from error
+    candidates = [stem]
+    if config is not None and getattr(config, "wide_residual", None) is not None:
+        # MCore builds with dedicated wide-residual layers name the variant; older ones
+        # implement wide residuals inside the ordinary layers and have no such spec.
+        candidates.insert(0, f"wide_residual_{stem}")
+    for name in candidates:
+        spec = getattr(module, name, None)
+        if isinstance(spec, ModuleSpec):
+            return spec
+    raise RuntimeError(f"The installed megatron.core has no {module_path}.{stem}, which Nemotron4 needs.")
 
 
 # TransformerConfig fields required by MCore's simplified sparse attention.
@@ -167,20 +191,22 @@ def require_nemotron4_ssa_mcore() -> None:
         )
 
 
-def nemotron4_ssa_stack_spec() -> ModuleSpec:
+def nemotron4_ssa_stack_spec(config: Any = None) -> ModuleSpec:
     """Return the gated-delta-product stack spec with simplified sparse attention.
 
     Identical to :func:`nemotron4_stack_spec` except that every attention layer (including the
     MTP block's) is MCore's ``SimplifiedSparseAttention``: ordinary GQA projections whose core
     attention attends to each query's top-k keys chosen by a learned single-head indexer.
+    ``config`` selects the variant as in :func:`nemotron4_stack_spec`:
+    ``transformer_impl='inference_optimized'`` uses ``gdp_ssa_inference_stack_spec``.
     A named function (not a lambda) so the provider stays serializable.
     """
     require_nemotron4_ssa_mcore()
-    from megatron.core.transformer.experimental_attention_variant.simplified_sparse_attention_layer_specs import (
-        gdp_ssa_stack_spec,
+    return _resolve_nemotron4_spec_variant(
+        "megatron.core.transformer.experimental_attention_variant.simplified_sparse_attention_layer_specs",
+        "gdp_ssa_stack_spec",
+        config,
     )
-
-    return gdp_ssa_stack_spec
 
 
 def nemotron4_nano_wide_residual() -> Any:
@@ -813,8 +839,10 @@ class Nemotron4VLModelProvider(Nemotron4ModelProvider):
         """Hybrid stack spec with the stride-safe GDP mixer substituted."""
         saved_args = getattr(self, "_saved_args", None)
         if saved_args is not None and getattr(saved_args, "spec", None):
-            # Native checkpoints name their own layer spec; honor it exactly.
-            spec = copy.deepcopy(import_module(saved_args.spec))
+            # Native checkpoints name their own layer spec; honor it up to its inference and
+            # wide-residual variants.
+            module_path, spec_name = saved_args.spec
+            spec = copy.deepcopy(_resolve_nemotron4_spec_variant(module_path, spec_name, self))
         else:
             spec = copy.deepcopy(self._resolve_hybrid_stack_spec())
         gdp_mixer_spec = spec.submodules.mamba_layer.submodules.mixer
